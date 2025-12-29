@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# R
+.RData
+.Rhistory
+*.Rout
+.Rproj.user/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files (keep code but exclude data if too large)
+*.pdf
+*.xlsx
+*.xls
+*.pptx
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+*.tmp
+*.log
+*.cache
+
+# Node
+node_modules/
+npm-debug.log
+
+# Large model files and checkpoints (exclude but keep code)
+code/archive/roberta_pbc_sentiment/
+code/scripts/roberta_pbc_sentiment/
+*.safetensors
+optimizer.pt
+model.bin
+
+# Large CSV files (can be regenerated)
+code/scripts/all_sentences*.csv
+code/archive/**/*.csv
+*.xlsx
+*.xls
+
+# Results (too large to push; regenerate locally)
+# code/results/**/*.csv
+# code/results/**/*.png

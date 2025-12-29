@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# R
+.Rhistory
+.RData
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environment
+.env/
+
+# Ignore editor/project files
+.vscode/
+
+# Data: keep tracked if already in repo; uncomment if you prefer to exclude raw data
+# data/raw/
