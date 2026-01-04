@@ -1,5 +1,0 @@
-"Index","Tone_Coef_Robust","Tone_p_value","Tone_Significant_5pct","LB_test_p","LB_Autocorr_Alert","ARCH_test_p","Nyblom_Statistic","Nyblom_Unstable_1pct","Sign_Bias_p_value","APGF_p_value"
-"SH",0.170121,0.696204,FALSE,0.02631,TRUE,0.021335,4.4654,TRUE,0.5319,NA
-"SZ",0.165602,0.630098,FALSE,0.009812,TRUE,0.02331,4.7271,TRUE,0.10911,NA
-"HS300",0.191614,0.685338,FALSE,0.01135,TRUE,0.02967,4.6854,TRUE,0.3322,NA
-"CSI500",0.250005,0.63787,FALSE,0.03512,TRUE,0.0199,6.5627,TRUE,NA,NA
