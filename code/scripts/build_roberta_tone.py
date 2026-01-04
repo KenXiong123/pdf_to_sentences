@@ -1,363 +1,379 @@
+# build_roberta_tone.py (v3)
+# -*- coding: utf-8 -*-
+"""
+Step: 构建季度级文本语气指标（央行季度货币政策报告）
+
+本版本输出 3 个核心指标（季度级）：
+1) tone_policy_z  : 主题=货币政策与流动性（zero-shot NLI + 稀疏化）
+2) tone_macro_z   : 主题=宏观基本面（zero-shot NLI + 稀疏化）
+3) tone_all_z     : 全报告情绪（不依赖 zero-shot；用句子级 roberta_neg_prob 压缩为 1 个数字）
+
+并同时输出：
+- tone_by_quarter_roberta.csv（季度指标）
+- tone_by_quarter_roberta_coverage.csv（诊断/覆盖）
+- all_sentences_with_roberta_score_bucket.csv（句子级：主题分数、Top1、最终权重）
+
+注意：保持输入/输出文件名与旧版本一致。
+"""
+
 import os
-from pathlib import Path
-import pandas as pd
+import math
+import warnings
+from typing import Dict, List, Tuple
+
 import numpy as np
+import pandas as pd
+import torch
+from datasets import Dataset
+from transformers import pipeline
+from transformers.pipelines.pt_utils import KeyDataset
 
-# ========= 配置 =========
-SENT_FILE = "all_sentences_with_roberta_score.csv"
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ========== 文件名（保持不变） ==========
+INPUT_FILE = "all_sentences_with_roberta_score.csv"
 OUT_FILE = "tone_by_quarter_roberta.csv"
-SENT_BUCKET_OUT = "all_sentences_with_roberta_score_bucket.csv"
-REPORT_DATES_FILE = "report_dates.csv"
-AUDIT = True
+COVERAGE_OUT = "tone_by_quarter_roberta_coverage.csv"
+BUCKET_OUT = "all_sentences_with_roberta_score_bucket.csv"
 
-# 仍然计算 expanding z 作为备选稳健性（不用于主回归）
-CALC_EXPANDING_Z = True
-MIN_HIST_QUARTERS = 8
+# ========== Zero-shot 配置 ==========
+MODEL_NAME = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+HYPOTHESIS_TEMPLATE = "这段文字涉及{}。"
+
+# 两个主题（更平行 + 提示词）
+CANDIDATE_LABELS = [
+    "货币政策与流动性（降准/降息/LPR/MLF/OMO/再贷款/信贷/社融/M2/资金面）",      # policy
+    "经济运行与宏观基本面（GDP/就业/消费/投资/外贸/工业/PMI/景气度）",           # macro
+]
+TOPIC_KEYS = ["policy", "macro"]
+
+# ========== 稀疏化参数（安全版） ==========
+# 句子级：Top1 置信度阈值（基础阈值，季度级还会自适应放宽）
+BASE_TAU = 0.50
+RELAX_TAUS = [0.50, 0.45, 0.40]
+GAP_THRESH = 0.10  # Top1-Top2 区分度阈值（小于则折扣）
+
+# 季度级：Top-N 配额（自适应）
+TOPN_FRAC = 0.12
+TOPN_MIN = 30
+TOPN_MAX = 80
+
+# ========== tone_all 构建参数 ==========
+# 每份报告取 Top-K “最有信息量句子”（按 |p - global_median|），再做截尾均值
+TONE_ALL_TOPK_MAX = 200
+TONE_ALL_TOPK_FRAC = 0.20
+TONE_ALL_TOPK_MIN = 50
+TONE_ALL_TRIM = 0.10  # 截尾比例（两端各去掉 10%）
 
 
-# ========= Topic buckets: policy / macro / risk =========
-# 说明：
-# 1) 先用 section_title（章节标题）判别；若缺失或无法判别，再用句子 text 的关键词兜底。
-# 2) 规则完全确定性，可复制；关键词表可在论文附录披露。
-# --------------------------------------------------------
+# ========= 工具函数 =========
+def get_device():
+    """优先 MPS，其次 CUDA，否则 CPU"""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return 0  # pipeline(device=0)
+    return -1
 
-TITLE_POLICY_KW = [
-    "货币政策", "政策取向", "下一阶段", "政策思路", "政策操作", "政策工具", "操作", "工具",
-    "利率", "准备金率", "存款准备金", "流动性", "公开市场", "再贷款", "再贴现", "MLF", "SLF", "LPR",
-]
-TITLE_MACRO_KW = [
-    "经济", "宏观", "形势", "运行", "增长", "物价", "通胀", "就业", "国际收支", "外部环境", "金融形势",
-]
-TITLE_RISK_KW = [
-    "风险", "不确定", "金融稳定", "稳定", "脆弱", "隐患", "压力",
-]
 
-TEXT_POLICY_KW = [
-    "保持流动性", "合理充裕", "逆周期", "调节", "稳健", "灵活适度", "相机抉择",
-    "降准", "降息", "加息", "上调", "下调", "公开市场操作", "利率走廊", "融资成本",
-    "MLF", "SLF", "LPR", "再贷款", "再贴现", "中期借贷便利", "常备借贷便利",
-]
-TEXT_MACRO_KW = [
-    "GDP", "经济增长", "消费", "投资", "出口", "进口", "工业", "服务业", "CPI", "PPI",
-    "物价", "通胀", "就业", "收入", "PMI", "国际收支", "外需", "汇率", "财政",
-]
-TEXT_RISK_KW = [
-    "风险", "不确定性", "波动", "压力", "脆弱", "隐患", "违约", "信用风险", "系统性",
-    "金融稳定", "杠杆", "泡沫", "房地产风险", "地方债", "影子银行", "外溢", "资本流动冲击",
-]
+def normalize_label_scores(out: Dict) -> Dict[str, float]:
+    """把 pipeline 的 labels/scores 转成 dict"""
+    labels = out.get("labels", [])
+    scores = out.get("scores", [])
+    return {str(l): float(s) for l, s in zip(labels, scores)}
 
-def _kw_score(s: str, kws):
-    if not isinstance(s, str):
+
+def compute_gap_factor(top1: float, top2: float) -> float:
+    """区分度折扣：gap>=阈值 -> 1；否则线性折扣到 0"""
+    gap = float(top1 - top2)
+    if gap >= GAP_THRESH:
+        return 1.0
+    if gap <= 0:
+        return 0.0
+    return gap / GAP_THRESH
+
+
+def calc_topn(n_sent: int) -> int:
+    if n_sent <= 0:
         return 0
-    ss = s.strip()
-    if not ss:
-        return 0
-    return sum(1 for kw in kws if kw and (kw in ss))
-
-def assign_bucket(section_title: str, text: str):
-    """返回 (bucket, source)，bucket ∈ {policy, macro, risk}"""
-    title = section_title if isinstance(section_title, str) else ""
-    sent = text if isinstance(text, str) else ""
-
-    # 1) 标题优先（权重更高）
-    t_r = _kw_score(title, TITLE_RISK_KW)
-    t_p = _kw_score(title, TITLE_POLICY_KW)
-    t_m = _kw_score(title, TITLE_MACRO_KW)
-    if max(t_r, t_p, t_m) > 0:
-        if t_r >= max(t_p, t_m):
-            return "risk", "title"
-        if t_p >= max(t_r, t_m):
-            return "policy", "title"
-        return "macro", "title"
-
-    # 2) 句子关键词兜底（risk > policy > macro，避免风险沟通漏判）
-    s_r = _kw_score(sent, TEXT_RISK_KW)
-    s_p = _kw_score(sent, TEXT_POLICY_KW)
-    s_m = _kw_score(sent, TEXT_MACRO_KW)
-    if max(s_r, s_p, s_m) > 0:
-        if s_r >= max(s_p, s_m):
-            return "risk", "text"
-        if s_p >= max(s_r, s_m):
-            return "policy", "text"
-        return "macro", "text"
-
-    # 3) 默认：macro（描述性内容占比最高）
-    return "macro", "default"
-# =======================
+    n = int(round(TOPN_FRAC * n_sent))
+    return int(np.clip(n, TOPN_MIN, TOPN_MAX))
 
 
-def _resolve(path_str: str) -> Path:
-    """优先当前工作目录，其次脚本目录。"""
-    p = Path(path_str)
-    if p.exists():
-        return p
-    p2 = Path(__file__).resolve().parent / path_str
-    if p2.exists():
-        return p2
-    raise FileNotFoundError(f"找不到文件：{path_str}（当前目录或脚本目录）")
+def trimmed_mean(x: np.ndarray, trim: float) -> float:
+    if len(x) == 0:
+        return float("nan")
+    x = np.sort(np.asarray(x, dtype=float))
+    if not (0.0 <= trim < 0.5):
+        return float(np.mean(x))
+    k = int(math.floor(trim * len(x)))
+    if 2 * k >= len(x):
+        return float(np.mean(x))
+    return float(np.mean(x[k: len(x) - k]))
 
 
-def zscore_full_sample(s: pd.Series) -> pd.Series:
-    """全样本 z-score（主回归口径）"""
-    m = s.mean()
-    std = s.std(ddof=1)
-    if std == 0 or pd.isna(std):
-        return pd.Series([0.0] * len(s), index=s.index)
-    return (s - m) / std
-
-
-def zscore_full(s: pd.Series):
-    """full-sample z-score（用于主回归，与你当前 tone_all_z 一致）"""
-    mu = s.mean(skipna=True)
-    sd = s.std(ddof=1, skipna=True)
-    if sd is None or sd == 0 or np.isnan(sd):
-        return (s * 0.0).fillna(0.0)
-    z = (s - mu) / sd
-    z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return z
-
-
-def zscore_expanding_no_lookahead(s: pd.Series, min_hist_quarters: int = 8):
+def build_tone_all_for_group(g: pd.DataFrame, global_med: float) -> Tuple[float, float, Dict]:
     """
-    expanding z-score（无前视，备选稳健性）：
-    z_t 使用 t 之前的历史均值与标准差；历史不足期 z=0，并给出 avail=0。
+    返回：tone_all（截尾均值）、tone_p90_all，以及 coverage dict
     """
-    hist_mean = s.expanding(min_periods=min_hist_quarters).mean().shift(1)
-    hist_std = s.expanding(min_periods=min_hist_quarters).std(ddof=1).shift(1)
-    z = (s - hist_mean) / hist_std
-    avail = hist_std.notna().astype(int)
-    z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return z, avail
+    p = pd.to_numeric(g["roberta_neg_prob"], errors="coerce").dropna().astype(float).values
+    n = len(p)
+    if n == 0:
+        return float("nan"), float("nan"), {"n_sent": 0, "k": 0, "k_eff": 0, "trim": TONE_ALL_TRIM}
 
+    info = np.abs(p - global_med)
+    # Top-K：min(200, 20%*n) 且至少 50（不够则取全部）
+    k = int(min(TONE_ALL_TOPK_MAX, max(TONE_ALL_TOPK_MIN, int(round(TONE_ALL_TOPK_FRAC * n)))))
+    k = int(min(k, n))
+    if k <= 0:
+        k = n
 
-def _is_real_part(year, quarter, section: str) -> bool:
-    sec = str(section).strip()
-    try:
-        y = int(year)
-        q = int(quarter)
-    except Exception:
-        return False
-    if y == 2002 and q == 3:
-        return sec in ["S1", "S2", "S3"]
-    return sec in ["S1", "S2", "S3", "S4"]
+    # 取 top-k
+    idx = np.argpartition(-info, k - 1)[:k]
+    sel = p[idx]
 
+    tone_all = trimmed_mean(sel, TONE_ALL_TRIM)
+    tone_p90 = float(np.percentile(sel, 90)) if len(sel) > 0 else float("nan")
 
-def _is_guidance_part(year, quarter, section: str) -> bool:
-    sec = str(section).strip()
-    try:
-        y = int(year)
-        q = int(quarter)
-    except Exception:
-        return False
-    if y == 2002 and q == 3:
-        return sec == "S4"
-    return sec == "S5"
+    cov = {
+        "n_sent": int(n),
+        "k": int(k),
+        "k_eff": int(len(sel)),
+        "trim": float(TONE_ALL_TRIM),
+        "global_median": float(global_med),
+        "tone_all_raw": float(tone_all) if not np.isnan(tone_all) else float("nan"),
+        "tone_p90_raw": float(tone_p90) if not np.isnan(tone_p90) else float("nan"),
+    }
+    return tone_all, tone_p90, cov
 
 
 def main():
-    # ---------- 读句子数据 ----------
-    df = pd.read_csv(_resolve(SENT_FILE))
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
 
-    required_cols = {"year", "quarter", "section", "roberta_neg_prob", "text"}
-    missing = required_cols - set(df.columns)
+    print(f"[Info] Loading {INPUT_FILE} ...")
+    df = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
+    required = {"year", "quarter", "text", "roberta_neg_prob"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"{SENT_FILE} 缺少必要列：{missing}")
+        raise ValueError(f"Missing required columns in {INPUT_FILE}: {missing}")
 
     df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
     df["quarter"] = pd.to_numeric(df["quarter"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["year", "quarter", "text"]).copy()
+    df["text"] = df["text"].astype(str)
+    df["roberta_neg_prob"] = pd.to_numeric(df["roberta_neg_prob"], errors="coerce")
 
-    if AUDIT:
-        bad_yq = df["year"].isna() | df["quarter"].isna()
-        print(f"[AUDIT] year/quarter NA rows: {bad_yq.sum()} / {len(df)}")
-        bad_q = (~df["quarter"].isin([1, 2, 3, 4])) & df["quarter"].notna()
-        print(f"[AUDIT] quarter not in 1-4 rows: {bad_q.sum()} / {len(df)}")
-        neg = df["roberta_neg_prob"]
-        out01 = ((neg < 0) | (neg > 1)) & neg.notna()
-        print(f"[AUDIT] roberta_neg_prob out of [0,1]: {out01.sum()} / {len(df)}")
+    # ========== 0) 全局中位数（tone_all 用） ==========
+    global_med = float(df["roberta_neg_prob"].median(skipna=True))
+    print(f"[Info] Global median(roberta_neg_prob) = {global_med:.6f}")
 
-    # ---------- 句子 tone ----------
-    df["tone_sent"] = 1.0 - df["roberta_neg_prob"]
-
-    # ---------- Bucket（policy/macro/risk） ----------
-    if "section_title" not in df.columns:
-        df["section_title"] = ""
-    bucket_out = df.apply(lambda r: assign_bucket(r.get("section_title", ""), r.get("text", "")), axis=1)
-    df["bucket"] = bucket_out.apply(lambda x: x[0])
-    df["bucket_source"] = bucket_out.apply(lambda x: x[1])
-
-    if AUDIT:
-        print("[AUDIT] bucket_source distribution:")
-        print(df["bucket_source"].value_counts(dropna=False).to_string())
-        print("[AUDIT] bucket distribution:")
-        print(df["bucket"].value_counts(dropna=False).to_string())
-
-        # 输出带 bucket 的句子级数据（便于审计/复现实验）
-        try:
-            keep_cols = [c for c in ["id","year","quarter","section","section_title","bucket","bucket_source","roberta_neg_prob","tone_sent","text"] if c in df.columns]
-            df[keep_cols].to_csv(_resolve(SENT_BUCKET_OUT), index=False, encoding="utf-8-sig")
-            print(f"[AUDIT] sentence-level bucket file saved: {SENT_BUCKET_OUT}")
-        except Exception as e:
-            print(f"[AUDIT] failed to save sentence-level bucket file: {e}")
-
-
-
-    # ---------- Real / Guidance 标记 ----------
-    df["is_real"] = df.apply(lambda r: _is_real_part(r["year"], r["quarter"], r["section"]), axis=1)
-    df["is_guid"] = df.apply(lambda r: _is_guidance_part(r["year"], r["quarter"], r["section"]), axis=1)
-
-    grp = ["year", "quarter"]
-
-    # ---------- Bucket 季度聚合（mean / p90 / std） ----------
-    g = df.groupby(grp + ["bucket"], dropna=True)["tone_sent"]
-    bucket_agg = g.agg(
-        tone_mean="mean",
-        tone_p90=lambda x: x.quantile(0.9),
-        tone_std=lambda x: x.std(ddof=1),
-        n="size",
-    ).reset_index()
-
-    # pivot 到宽表
-    def _pivot(metric, prefix):
-        wide = bucket_agg.pivot_table(index=grp, columns="bucket", values=metric, aggfunc="first").reset_index()
-        wide.columns = [c if c in grp else f"{prefix}_{c}" for c in wide.columns]
-        return wide
-
-    tone_bucket_mean = _pivot("tone_mean", "tone")
-    tone_bucket_p90 = _pivot("tone_p90", "tone_p90")
-    tone_bucket_std = _pivot("tone_std", "tone_std")
-    tone_bucket_n = _pivot("n", "n")
-
-    # 合并 bucket 指标（与 tone_all/real/guid 并存）
-    tone_bucket = tone_bucket_mean.merge(tone_bucket_p90, on=grp, how="left") \
-                                .merge(tone_bucket_std, on=grp, how="left") \
-                                .merge(tone_bucket_n, on=grp, how="left")
-
-    # 缺失填充：n=0；tone 指标缺失保留 NaN（后续 z-score 会转 0）
-    for c in [c for c in tone_bucket.columns if c.startswith("n_")]:
-        tone_bucket[c] = tone_bucket[c].fillna(0).astype(int)
-
-
-    # ---------- 季度聚合 ----------
-    tone_all = (
-        df.groupby(grp, dropna=True)["tone_sent"]
-        .mean()
-        .reset_index()
-        .rename(columns={"tone_sent": "tone_all"})
-    )
-    tone_real = (
-        df[df["is_real"]]
-        .groupby(grp, dropna=True)["tone_sent"]
-        .mean()
-        .reset_index()
-        .rename(columns={"tone_sent": "tone_real"})
-    )
-    tone_guid = (
-        df[df["is_guid"]]
-        .groupby(grp, dropna=True)["tone_sent"]
-        .mean()
-        .reset_index()
-        .rename(columns={"tone_sent": "tone_guid"})
+    # ========== 1) Zero-shot 分类 ==========
+    print("[Info] Building zero-shot pipeline ...")
+    device = get_device()
+    clf = pipeline(
+        "zero-shot-classification",
+        model=MODEL_NAME,
+        device=device,
     )
 
-    tone_q = (
-        tone_all
-        .merge(tone_real, on=grp, how="left")
-        .merge(tone_guid, on=grp, how="left")
-        .sort_values(grp)
-        .reset_index(drop=True)
-    )
+    # 只对文本做推理
+    ds = Dataset.from_pandas(df[["text"]].reset_index(drop=True))
+    print("[Info] Running zero-shot classification (this can take a while) ...")
 
-    # ---------- merge bucket metrics ----------
-    tone_q = tone_q.merge(tone_bucket, on=grp, how="left")
+    outputs = []
+    for out in clf(
+        KeyDataset(ds, "text"),
+        candidate_labels=CANDIDATE_LABELS,
+        hypothesis_template=HYPOTHESIS_TEMPLATE,
+        multi_label=True,
+        batch_size=16,
+        truncation=True,
+    ):
+        outputs.append(out)
 
-    # ---------- 主口径：全样本 z-score（用于回归） ----------
-    tone_q["tone_all_z"] = zscore_full_sample(tone_q["tone_all"])
-    tone_q["tone_real_z"] = zscore_full_sample(tone_q["tone_real"])
-    tone_q["tone_guid_z"] = zscore_full_sample(tone_q["tone_guid"])
+    # 把输出拼回 df
+    score_policy = []
+    score_macro = []
+    top1_label = []
+    top1_score = []
+    top2_score = []
+    gap_factor = []
 
-    # ---------- Bucket z-score（full-sample；用于主回归） ----------
-    for base in ["tone_policy", "tone_macro", "tone_risk",
-                 "tone_p90_policy", "tone_p90_macro", "tone_p90_risk",
-                 "tone_std_policy", "tone_std_macro", "tone_std_risk"]:
-        if base in tone_q.columns:
-            tone_q[base + "_z"] = zscore_full(tone_q[base])
+    for out in outputs:
+        sc = normalize_label_scores(out)
+        sp = float(sc.get(CANDIDATE_LABELS[0], 0.0))
+        sm = float(sc.get(CANDIDATE_LABELS[1], 0.0))
+        score_policy.append(sp)
+        score_macro.append(sm)
 
-
-    # ---------- 备选：expanding z-score（不用于主回归，仅供稳健性） ----------
-    if CALC_EXPANDING_Z:
-        tone_q["tone_all_z_exp"], tone_q["tone_all_z_exp_avail"] = zscore_expanding_no_lookahead(
-            tone_q["tone_all"], MIN_HIST_QUARTERS
-        )
-        tone_q["tone_real_z_exp"], tone_q["tone_real_z_exp_avail"] = zscore_expanding_no_lookahead(
-            tone_q["tone_real"], MIN_HIST_QUARTERS
-        )
-        tone_q["tone_guid_z_exp"], tone_q["tone_guid_z_exp_avail"] = zscore_expanding_no_lookahead(
-            tone_q["tone_guid"], MIN_HIST_QUARTERS
-        )
-
-        # bucket mean 的 expanding z（可选稳健性）
-        for base in ["tone_policy", "tone_macro", "tone_risk"]:
-            if base in tone_q.columns:
-                tone_q[base + "_z_exp"], tone_q[base + "_z_exp_avail"] = zscore_expanding_no_lookahead(
-                    tone_q[base], MIN_HIST_QUARTERS
-                )
-
-    # ---------- 合并报告日期（按 tone_q 的季度做 inner，自动丢弃 2025Q1-Q3） ----------
-    try:
-        rep = pd.read_csv(_resolve(REPORT_DATES_FILE))
-        if {"year", "quarter"}.issubset(rep.columns):
-            rep["year"] = pd.to_numeric(rep["year"], errors="coerce").astype("Int64")
-            rep["quarter"] = pd.to_numeric(rep["quarter"], errors="coerce").astype("Int64")
-            rep = rep.dropna(subset=["year", "quarter"]).drop_duplicates(subset=["year", "quarter"])
-
-            # 关键：只保留在 tone_q 中存在的季度（解决你看到的 3/99 缺失）
-            rep = rep.merge(tone_q[["year", "quarter"]], on=["year", "quarter"], how="inner")
-
-            keep = ["year", "quarter"] + (["report_date"] if "report_date" in rep.columns else [])
-            tone_q = tone_q.merge(rep[keep], on=["year", "quarter"], how="left")
-
-            if AUDIT:
-                chk = rep[["year", "quarter"]].merge(
-                    tone_q[["year", "quarter", "tone_all"]],
-                    on=["year", "quarter"],
-                    how="left",
-                )
-                miss_tone = chk["tone_all"].isna().sum()
-                print(f"[AUDIT] report quarters missing tone_all: {miss_tone} / {len(chk)}")
+        # Top1/Top2
+        if sp >= sm:
+            top1_label.append("policy")
+            top1_score.append(sp)
+            top2_score.append(sm)
+            gap_factor.append(compute_gap_factor(sp, sm))
         else:
-            print(f"[WARN] {REPORT_DATES_FILE} 不含 year/quarter，跳过合并。")
-    except FileNotFoundError:
-        print(f"[WARN] 未找到 {REPORT_DATES_FILE}，跳过合并报告日期。")
+            top1_label.append("macro")
+            top1_score.append(sm)
+            top2_score.append(sp)
+            gap_factor.append(compute_gap_factor(sm, sp))
 
-    # ---------- Guidance 覆盖审计 ----------
-    if AUDIT:
-        cnt_guid = (
-            df[df["is_guid"]]
-            .groupby(grp, dropna=True)
-            .size()
-            .rename("n_guid")
-            .reset_index()
-        )
-        tmp = tone_q.merge(cnt_guid, on=grp, how="left")
-        tmp["n_guid"] = tmp["n_guid"].fillna(0).astype(int)
-        zero_guid = tmp[tmp["n_guid"] == 0]
-        print(f"[AUDIT] quarters with n_guid==0: {len(zero_guid)}")
+    df["score_policy"] = score_policy
+    df["score_macro"] = score_macro
+    df["top1_label"] = top1_label
+    df["top1_score"] = top1_score
+    df["top2_score"] = top2_score
+    df["gap_factor"] = gap_factor
 
-    # ---------- 保护：如果 OUT_FILE 已有额外列（如 similarity_prev/avg_sent_len），合并保留 ----------
-    out_path = Path(OUT_FILE)
-    if out_path.exists():
-        old = pd.read_csv(out_path)
-        if {"year", "quarter"}.issubset(old.columns):
-            old["year"] = pd.to_numeric(old["year"], errors="coerce").astype("Int64")
-            old["quarter"] = pd.to_numeric(old["quarter"], errors="coerce").astype("Int64")
-            extra_cols = [c for c in old.columns if c not in tone_q.columns]
-            if extra_cols:
-                tone_q = tone_q.merge(old[["year", "quarter"] + extra_cols], on=["year", "quarter"], how="left")
+    # ========== 2) 句子级：硬分配 Top1 + 折扣权重 ==========
+    df["weight_policy_raw"] = 0.0
+    df["weight_macro_raw"] = 0.0
 
-    tone_q.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"[OK] RoBERTa 季度语气指标已保存到：{out_path}")
-    if AUDIT:
-        print(tone_q.head())
+    wraw = (df["top1_score"].astype(float) * df["gap_factor"].astype(float)).fillna(0.0)
+    df.loc[df["top1_label"] == "policy", "weight_policy_raw"] = wraw[df["top1_label"] == "policy"]
+    df.loc[df["top1_label"] == "macro", "weight_macro_raw"] = wraw[df["top1_label"] == "macro"]
+
+    # ========== 3) 季度级：Top-N + 自适应阈值 ==========
+    coverage_rows: List[Dict] = []
+    results: List[Dict] = []
+
+    grouped = df.groupby(["year", "quarter"], sort=True)
+
+    for (y, q), g in grouped:
+        g = g.copy()
+        n_total = len(g)
+        n_target = calc_topn(n_total)
+
+        row = {"year": int(y), "quarter": int(q), "n_sentences": int(n_total), "topn_target": int(n_target)}
+
+        # --- tone_all（不依赖 zero-shot） ---
+        tone_all, tone_p90_all, cov_all = build_tone_all_for_group(g, global_med)
+        row["tone_all"] = tone_all
+        row["tone_p90_all"] = tone_p90_all
+
+        coverage_rows.append({
+            "year": int(y), "quarter": int(q), "topic": "all",
+            "total_sentences_quarter": int(n_total),
+            "n_target": int(min(n_target, cov_all.get("k", 0))),  # 仅做参考
+            "n_selected": int(cov_all.get("k_eff", 0)),
+            "coverage_selected": float(cov_all.get("k_eff", 0) / n_total) if n_total else 0.0,
+            "tau_used": np.nan,
+            "avg_weight_selected": np.nan,
+            "avg_top_score_selected": np.nan,
+            "avg_gap_selected": np.nan,
+            "note": f"tone_all: topK={cov_all.get('k',0)} trim={cov_all.get('trim',0)}"
+        })
+
+        # --- 两个主题 ---
+        for topic in TOPIC_KEYS:
+            wcol_raw = f"weight_{topic}_raw"
+            # 分阶段放宽 tau，直到 eligible >= TOPN_MIN 或到最小阈值
+            tau_used = RELAX_TAUS[-1]
+            eligible = g[(g["top1_score"] >= RELAX_TAUS[0]) & (g[wcol_raw] > 0)]
+            for tau in RELAX_TAUS:
+                eligible = g[(g["top1_score"] >= tau) & (g[wcol_raw] > 0)]
+                tau_used = tau
+                if len(eligible) >= TOPN_MIN or tau == RELAX_TAUS[-1]:
+                    break
+
+            # 取 Top-N（按 weight_raw）
+            if n_target > 0 and len(eligible) > 0:
+                selected = eligible.nlargest(min(n_target, len(eligible)), columns=[wcol_raw]).copy()
+            else:
+                selected = eligible.copy()
+
+            # 最终权重列：只保留 selected，其余为 0（pandas 索引对齐）
+            wcol_final = f"weight_{topic}"
+            g[wcol_final] = 0.0
+            if len(selected) > 0:
+                g.loc[selected.index, wcol_final] = pd.to_numeric(selected[wcol_raw], errors="coerce").fillna(0.0)
+
+            # tone：加权平均（权重归一化）
+            denom = float(g[wcol_final].sum())
+            if denom > 0 and not np.isnan(denom):
+                p = pd.to_numeric(g["roberta_neg_prob"], errors="coerce").fillna(0.0)
+                tone = float((g[wcol_final] * p).sum() / denom)
+                tone_p90 = float(np.percentile(g.loc[g[wcol_final] > 0, "roberta_neg_prob"].dropna().values, 90))
+            else:
+                tone = float("nan")
+                tone_p90 = float("nan")
+
+            row[f"tone_{topic}"] = tone
+            row[f"tone_p90_{topic}"] = tone_p90
+
+            # coverage row
+            # 选中句子的 top1/gap/weight 统计
+            if len(selected) > 0:
+                avg_w = float(selected[wcol_raw].mean())
+                avg_s = float(selected["top1_score"].mean())
+                avg_gap = float((selected["top1_score"] - selected["top2_score"]).mean())
+            else:
+                avg_w = avg_s = avg_gap = 0.0
+
+            coverage_rows.append({
+                "year": int(y), "quarter": int(q), "topic": topic,
+                "total_sentences_quarter": int(n_total),
+                "n_top1": int((g["top1_label"] == topic).sum()),
+                "n_conf_ge_0_50": int(((g["top1_label"] == topic) & (g["top1_score"] >= 0.50)).sum()),
+                "tau_used": float(tau_used),
+                "n_eligible": int(len(eligible)),
+                "n_target": int(n_target),
+                "n_selected": int(len(selected)),
+                "coverage_selected": float(len(selected) / n_total) if n_total else 0.0,
+                "avg_weight_selected": float(avg_w),
+                "avg_top_score_selected": float(avg_s),
+                "avg_gap_selected": float(avg_gap),
+            })
+
+        results.append(row)
+
+        # 把最终权重回写到 df（对 bucket 输出很重要）
+        df.loc[g.index, "weight_policy"] = g.get("weight_policy", 0.0)
+        df.loc[g.index, "weight_macro"] = g.get("weight_macro", 0.0)
+
+    final_df = pd.DataFrame(results).sort_values(["year", "quarter"]).reset_index(drop=True)
+
+    # ========== 4) Z-score（季度层） ==========
+    print("[Info] Calculating Z-scores ...")
+    tone_cols = [c for c in final_df.columns if c.startswith("tone_")]
+    for c in tone_cols:
+        mu = float(final_df[c].mean(skipna=True))
+        sigma = float(final_df[c].std(skipna=True))
+        if sigma == 0.0 or np.isnan(sigma):
+            final_df[f"{c}_z"] = 0.0
+        else:
+            final_df[f"{c}_z"] = (final_df[c] - mu) / sigma
+
+    # ========== 5) 输出 ==========
+    # 5.1 季度指标
+    out = final_df.round(6)
+    out.to_csv(OUT_FILE, index=False, encoding="utf-8-sig")
+    print(f"✅ [DONE] Saved quarterly tone series to {OUT_FILE}")
+
+    # 5.2 coverage
+    cov_df = pd.DataFrame(coverage_rows).sort_values(["year", "quarter", "topic"]).reset_index(drop=True)
+    cov_df = cov_df.round(6)
+    cov_df.to_csv(COVERAGE_OUT, index=False, encoding="utf-8-sig")
+    print(f"✅ [DONE] Saved coverage report to {COVERAGE_OUT}")
+
+    # 5.3 bucket（句子级）
+    bucket_cols = [
+        "id", "year", "quarter", "section", "section_title", "sent_id_in_report",
+        "text", "roberta_neg_prob",
+        "score_policy", "score_macro",
+        "top1_label", "top1_score", "top2_score", "gap_factor",
+        "weight_policy_raw", "weight_macro_raw",
+        "weight_policy", "weight_macro",
+    ]
+    bucket = df[[c for c in bucket_cols if c in df.columns]].copy()
+    bucket = bucket.round(6)
+    bucket.to_csv(BUCKET_OUT, index=False, encoding="utf-8-sig")
+    print(f"✅ [DONE] Saved sentence-level bucket to {BUCKET_OUT}")
+
+    print("-" * 60)
+    print("All done.")
+    print("-" * 60)
 
 
 if __name__ == "__main__":

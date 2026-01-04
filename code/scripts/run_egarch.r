@@ -1,156 +1,225 @@
-# run_egarch.r  (NO short-end rate control)
-# install.packages(c("readr", "dplyr", "xts", "rugarch", "tidyr"))
+# run_egarch.r
+# eGARCH-X（对齐姜富伟框架）+ 文本变量两种模式（all / split）
+# 说明：
+# - 本脚本只使用新列名：tone_p90_policy_z, tone_p90_macro_z, tone_p90_all_z, Similarity, Readability
+# - ARMA 自动选阶：先用 ARMA(+X) 的 BIC 选 (p,q)，再固定阶数拟合 EGARCH-X（比“多次 EGARCH 拟合挑阶”稳定）
 
 library(readr)
 library(dplyr)
 library(xts)
 library(rugarch)
-library(tidyr)
 
 DATA_FILE <- "egarch_daily_data_roberta.csv"
 
-# ========= 开关 =========
-USE_RAW_TONE <- FALSE            # TRUE: ToneAllEvent_raw; FALSE: ToneAllEvent_z
-USE_POLICY_SURPRISE <- FALSE     # TRUE: 方差方程用 PolicySurpriseEvent; FALSE: 用 SimilarityEvent
-FILTER_TO_FORECAST_PERIOD <- FALSE  # TRUE: 从 GDPForecastAvailEvent 首次=1 的日期起估计（可选）
-# =======================
+OUT_SH    <- "egarch_result_SH_roberta_r.txt"
+OUT_SZ    <- "egarch_result_SZ_roberta_r.txt"
+OUT_HS300 <- "egarch_result_HS300_roberta_r.txt"
+OUT_CSI500<- "egarch_result_CSI500_roberta_r.txt"
 
-tone_col <- if (USE_RAW_TONE) "ToneAllEvent_raw" else "ToneAllEvent_z"
-TONE_COLS <- c(tone_col, "TonePolicyEvent_z", "ToneMacroEvent_z", "ToneRiskEvent_z")
-TONE_COLS <- unique(TONE_COLS)
-TONE_COLS <- c(tone_col_local, "TonePolicyEvent_z", "ToneMacroEvent_z", "ToneRiskEvent_z")
-TONE_COLS <- unique(TONE_COLS)
-sim_col  <- if (USE_POLICY_SURPRISE) "PolicySurpriseEvent" else "SimilarityEvent"
+# ================== 配置区 ==================
+# 文本变量模式：
+# - "all"  : S_gdp + S_policy + tone_p90_all_z
+# - "split": S_gdp + S_policy + tone_p90_policy_z + tone_p90_macro_z
+TEXT_MODE <- "split"
 
-# 1) 读数据 ------------------------------------------------------------------
-df <- read_csv(DATA_FILE, col_types = cols(date = col_date())) %>%
-  arrange(date)
+# ARMA 阶数选择：
+# - "fixed": 使用 FIXED_ARMA
+# - "auto" : 用 ARMA(含xreg) 的 BIC 选阶
+ARMA_MODE <- "auto"
+FIXED_ARMA <- c(1, 0)
 
-cat("[INFO] Read:", DATA_FILE, "\n")
-cat("[INFO] Using tone:", tone_col_local, "\n")
-cat("[INFO] Using variance text var:", sim_col, "\n")
-cat("[INFO] Columns:\n")
-print(colnames(df))
+ARMA_CANDIDATES <- list(
+  c(0,0), c(1,0), c(1,1), c(2,0), c(2,1), c(0,1)
+)
 
-# 2) 可选：按 GDP forecast 可用期截断样本 -----------------------------------
-if (FILTER_TO_FORECAST_PERIOD && ("GDPForecastAvailEvent" %in% colnames(df))) {
-  first_ok <- df %>%
-    filter(GDPForecastAvailEvent == 1) %>%
-    summarise(m = min(date, na.rm = TRUE)) %>%
-    pull(m)
+# 分布：t
+DIST_MODEL <- "std"
+# ===========================================
 
-  if (!is.na(first_ok)) {
-    cat("[INFO] FILTER_TO_FORECAST_PERIOD=TRUE, sample starts at:", as.character(first_ok), "\n")
-    df <- df %>% filter(date >= first_ok)
-  } else {
-    cat("[WARN] No GDPForecastAvailEvent==1 found. Skip truncation.\n")
+drop_bad_xcols <- function(X, tag){
+  if (is.null(X) || ncol(X) == 0) {
+    return(list(X = X, dropped = character(0)))
   }
-} else if (FILTER_TO_FORECAST_PERIOD) {
-  cat("[WARN] GDPForecastAvailEvent column not found. Skip truncation.\n")
+  keep <- rep(TRUE, ncol(X))
+  reasons <- rep("", ncol(X))
+
+  for (j in seq_len(ncol(X))){
+    x <- X[, j]
+    if (!all(is.finite(x))) {
+      keep[j] <- FALSE
+      reasons[j] <- "non-finite"
+      next
+    }
+    s <- sd(x)
+    if (is.na(s) || s == 0) {
+      keep[j] <- FALSE
+      reasons[j] <- "zero-variance"
+      next
+    }
+  }
+
+  dropped <- colnames(X)[!keep]
+  if (length(dropped) > 0){
+    cat("[WARN] Dropping", tag, "external regressors with zero-variance/non-finite:\n")
+    for (j in which(!keep)){
+      x <- X[, j]
+      nnz <- sum(x != 0)
+      nu  <- length(unique(x))
+      s   <- sd(x)
+      cat(" -", colnames(X)[j], "(", reasons[j], ", nonzero=", nnz, ", uniq=", nu, ", sd=", format(s, digits=6), ")\n")
+    }
+  }
+  return(list(X = X[, keep, drop=FALSE], dropped = dropped))
 }
 
-# 3) 模型变量列表（严格不含 short_rate_chg）---------------------------------
-MEAN_X <- c("S_gdp", "S_policy", tone_col_local)    # <-- 不含任何 short rate 控制
-VAR_X  <- c("D_gdp", "D_policy", "D_report", "ReadabilityEvent", sim_col)
-
-# 4) 单指数 eGARCH-X ---------------------------------------------------------
-run_egarch_for_index <- function(df, ret_col, tone_col_local_override=NULL) {
-  # allow overriding tone regressor
-  tone_col_local <- if (!is.null(tone_col_local_override)) tone_col_local_override else tone_col_local
-
-
-  cat("\n", strrep("=", 95), "\n", sep = "")
-  cat("Estimating Jiang-style eGARCH(1,1)-X for", ret_col,
-      "| tone:", tone_col_local,
-      "| var text:", sim_col, "\n")
-  cat(strrep("=", 95), "\n")
-
-  if (!(ret_col %in% colnames(df))) {
-    cat("[WARN] Return column missing:", ret_col, "\n")
-    return(NULL)
+build_xreg <- function(df, cols){
+  miss <- cols[!cols %in% colnames(df)]
+  if (length(miss) > 0){
+    stop(paste0("Missing required columns in dataset: ", paste(miss, collapse=", ")))
   }
+  X <- as.matrix(df[, cols])
+  colnames(X) <- cols
+  return(X)
+}
 
-  needed <- unique(c("date", ret_col, MEAN_X, VAR_X))
-  missing <- setdiff(needed, colnames(df))
-  if (length(missing) > 0) {
-    cat("[ERROR] Missing columns in data:\n")
-    print(missing)
-    return(NULL)
-  }
-
-  tmp <- df %>%
-    select(all_of(needed)) %>%
-    # 事件变量 NA -> 0
-    mutate(across(all_of(setdiff(c(MEAN_X, VAR_X), ret_col)), ~replace_na(., 0))) %>%
-    filter(!is.na(.data[[ret_col]])) %>%
-    filter(complete.cases(.))
-
-  cat("[INFO] Sample size:", nrow(tmp), "\n")
-  cat("[INFO] Counts: D_report=", sum(tmp$D_report),
-      " D_gdp=", sum(tmp$D_gdp),
-      " D_policy=", sum(tmp$D_policy), "\n")
-
-  y <- 100 * tmp[[ret_col]]                 # 与姜富伟一致：把收益率放大 100
-  y_xts <- xts(y, order.by = tmp$date)
-
-  X_mean <- as.matrix(tmp[, MEAN_X, drop = FALSE])
-  X_var  <- as.matrix(tmp[, VAR_X,  drop = FALSE])
-
+fit_egarch <- function(y_xts, Xmean, Xvar, armaOrder){
   spec <- ugarchspec(
     variance.model = list(
       model = "eGARCH",
-      garchOrder = c(1, 1),
-      external.regressors = X_var
+      garchOrder = c(1,1),
+      external.regressors = Xvar
     ),
     mean.model = list(
-      armaOrder = c(1, 0),       # AR(1)
+      armaOrder = armaOrder,
       include.mean = TRUE,
-      external.regressors = X_mean
+      external.regressors = Xmean
     ),
-    distribution.model = "std"
+    distribution.model = DIST_MODEL
   )
-
-  fit <- ugarchfit(spec = spec, data = y_xts, solver = "hybrid")
-
-  tone_tag <- tone_col_local
-  tone_tag <- gsub("^Tone", "", tone_tag)
-  tone_tag <- gsub("Event_raw$|Event_z$|_raw$|_z$", "", tone_tag)
-  tone_tag <- gsub("[^A-Za-z0-9]+", "", tone_tag)
-
-  out_file <- paste0("egarch_result_", ret_col, "_", tone_tag, "_jiang_roberta_all_",
-                     if (USE_RAW_TONE) "raw" else "z",
-                     "_", if (USE_POLICY_SURPRISE) "surprise" else "sim",
-                     "_no_rate.txt")
-
-  sink(out_file)
-  cat("Jiang-style eGARCH(1,1)-X (NO short rate control)\n")
-  cat("Index:", ret_col, "\n")
-  cat("Tone:", tone_col_local, "\n")
-  cat("Var text:", sim_col, "\n\n")
-  cat("Mean regressors:\n"); print(MEAN_X)
-  cat("\nVariance regressors:\n"); print(VAR_X)
-  cat("\n\n--- Fit ---\n")
-  show(fit)
-  sink()
-
-  cat("[OK] Saved:", out_file, "\n")
+  fit <- tryCatch(
+    ugarchfit(spec = spec, data = y_xts, solver = "hybrid"),
+    error = function(e) NULL
+  )
   return(fit)
 }
 
-# 5) 循环估计 ----------------------------------------------------------------
-index_list <- c("SH", "SZ", "HS300", "CSI500")
-fits <- list()
+select_arma_by_bic_arima <- function(y_vec, Xmean){
+  n <- length(y_vec)
+  res <- data.frame(p = integer(0), q = integer(0), bic = numeric(0), aic = numeric(0), ok = logical(0))
+  best_bic <- Inf
+  best_ord <- c(1,0)
 
-for (idx in index_list) {
-  fits[[idx]] <- list()
-  for (tc in TONE_COLS) {
-    if (!(tc %in% colnames(df))) {
-      cat("[WARN] tone col not found, skip:", tc, "
-")
+  for (ord in ARMA_CANDIDATES){
+    p <- ord[1]; q <- ord[2]
+    fit <- tryCatch(
+      stats::arima(y_vec, order = c(p,0,q), xreg = Xmean, include.mean = TRUE, method = "CSS-ML"),
+      error = function(e) NULL
+    )
+    if (is.null(fit) || !is.finite(fit$loglik)){
+      res <- rbind(res, data.frame(p=p, q=q, bic=NA, aic=NA, ok=FALSE))
       next
     }
-    fits[[idx]][[tc]] <- run_egarch_for_index(df, idx, tc)
+    k <- length(fit$coef)
+    aic <- -2*fit$loglik + 2*k
+    bic <- -2*fit$loglik + log(n)*k
+    ok <- is.finite(bic)
+    res <- rbind(res, data.frame(p=p, q=q, bic=bic, aic=aic, ok=ok))
+    if (ok && bic < best_bic){
+      best_bic <- bic
+      best_ord <- c(p,q)
+    }
   }
+  return(list(order = best_ord, table = res))
 }
 
-cat("\n[INFO] Done.\n")
+run_one_index <- function(df, ycol, out_file){
+  cat("============================================================\n")
+  cat("Index:", ycol, "\n")
+  cat("TEXT_MODE:", TEXT_MODE, " | ARMA_MODE:", ARMA_MODE, "\n")
+
+  if (TEXT_MODE == "all"){
+    mean_cols <- c("S_gdp", "S_policy", "tone_p90_all_z")
+  } else if (TEXT_MODE == "split"){
+    mean_cols <- c("S_gdp", "S_policy", "tone_p90_policy_z", "tone_p90_macro_z")
+  } else {
+    stop("TEXT_MODE must be 'all' or 'split'")
+  }
+  var_cols <- c("D_gdp", "D_policy", "D_report", "Readability", "Similarity")
+
+  required_cols <- c("date", ycol, mean_cols, var_cols)
+  missing <- setdiff(required_cols, colnames(df))
+  if (length(missing) > 0){
+    stop(paste0("Dataset missing required columns: ", paste(missing, collapse=", ")))
+  }
+
+  sub <- df[, c("date", ycol, mean_cols, var_cols)]
+  sub <- sub %>% mutate(across(-date, as.numeric))
+  sub <- sub %>% filter(!is.na(.data[[ycol]]))
+
+  # xreg 缺失 -> 0
+  for (c in c(mean_cols, var_cols)){
+    sub[[c]] <- ifelse(is.finite(sub[[c]]), sub[[c]], 0)
+    sub[[c]][is.na(sub[[c]])] <- 0
+  }
+
+  Xmean <- build_xreg(sub, mean_cols)
+  Xvar  <- build_xreg(sub, var_cols)
+  dm <- drop_bad_xcols(Xmean, "mean")
+  dv <- drop_bad_xcols(Xvar,  "variance")
+  Xmean2 <- dm$X
+  Xvar2  <- dv$X
+
+  y_xts <- xts(sub[[ycol]], order.by = as.Date(sub$date))
+  y_vec <- as.numeric(sub[[ycol]])
+
+  arma_used <- FIXED_ARMA
+  arma_table <- NULL
+  if (ARMA_MODE == "fixed"){
+    arma_used <- FIXED_ARMA
+  } else if (ARMA_MODE == "auto"){
+    sel <- select_arma_by_bic_arima(y_vec, Xmean2)
+    arma_used <- sel$order
+    arma_table <- sel$table
+  } else {
+    stop("ARMA_MODE must be 'fixed' or 'auto'")
+  }
+
+  fit <- fit_egarch(y_xts, Xmean2, Xvar2, arma_used)
+
+  sink(out_file)
+  cat("============================================================\n")
+  cat("EGARCH-X results\n")
+  cat("Index:", ycol, "\n")
+  cat("TEXT_MODE:", TEXT_MODE, "\n")
+  cat("ARMA_MODE:", ARMA_MODE, "\n")
+  cat("ARMA used:", arma_used[1], ",", arma_used[2], "\n")
+  cat("Mean regressors used:", paste(colnames(Xmean2), collapse=", "), "\n")
+  cat("Variance regressors used:", paste(colnames(Xvar2), collapse=", "), "\n")
+  cat("============================================================\n\n")
+
+  if (!is.null(arma_table)){
+    cat("[ARMA candidate table] (BIC lower is better; selected based on ARMA+X regression)\n")
+    print(arma_table)
+    cat("\n")
+  }
+
+  if (is.null(fit)){
+    cat("[ERROR] EGARCH-X failed to fit.\n")
+    sink()
+    return(NULL)
+  }
+
+  show(fit)
+  sink()
+  cat("✅ Saved:", out_file, "\n")
+  return(fit)
+}
+
+df <- read_csv(DATA_FILE, show_col_types = FALSE) %>% as.data.frame()
+if (!("date" %in% colnames(df))) stop("dataset missing 'date' column")
+df$date <- as.Date(df$date)
+
+invisible(run_one_index(df, "SH", OUT_SH))
+invisible(run_one_index(df, "SZ", OUT_SZ))
+invisible(run_one_index(df, "HS300", OUT_HS300))
+invisible(run_one_index(df, "CSI500", OUT_CSI500))

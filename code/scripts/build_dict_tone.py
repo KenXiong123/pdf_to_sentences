@@ -1,169 +1,281 @@
+# build_dict_tone.py
 # -*- coding: utf-8 -*-
 """
-build_dict_tone.py (Final Version)
-
-策略：回归单词典 (Du/L&M) 以保证央行语境的纯净度，但保留“反转短语”逻辑以修正语义。
-
-处理逻辑：
-1. 加载 Du 情感词典。
-2. 预处理：检测“降幅收窄”等反转短语，给予正向加分。
-3. 分词 & 匹配：计算 Pos/Neg 词数。
-4. 否定逻辑：处理“不/非/无”。
-5. 输出：Neg_net (供 RoBERTa 训练的弱标签) 和 is_numeric (供过滤)。
+Step 1: 姜富伟 (2021) 情感单元法 (Excel Version)
+核心修复：
+1. 直接读取 'ChineseSentimentDictionary.xlsx'。
+2. 自动识别 Sheet (Positive/Political -> +1, Negative -> -1) 并合并。
+3. 严格执行姜富伟的"动态区间扫描"算法。
+4. 修复"增长"等关键词缺失问题。
+5. 针对 CPI/通胀话题进行专项逻辑修正（上涨=负面，回落=正面）。
 """
 
 import pandas as pd
 import jieba
-import re
-from typing import Set
+import sys
+from pathlib import Path
+from tqdm import tqdm
 
-# ========= 0. 基础路径配置 =========
-DICT_PATH = "ChineseSentimentDictionary.xlsx"      # 仅使用 Du 词典
+# ========= 1. 文件配置 =========
+# 用户指定的文件名
+DICT_FILE = "ChineseSentimentDictionary.xlsx"
 SENT_PATH = "all_sentences.csv"
 OUT_SENT_PATH = "all_sentences_with_dict_scores.csv"
-OUT_TONE_Q_PATH = "tone_by_quarter_dict.csv"
 
-TEXT_COL = "text"
-YEAR_COL = "year"
-QUARTER_COL = "quarter"
+# ========= 2. 算法参数 =========
+# 姜富伟标准：剔除数字占比超过 50% 的句子
+DIGIT_THRESHOLD = 0.50 
 
-# ========= 1. 读取 Du 词典 =========
+# 否定词典 (姜富伟逻辑核心)
+NEGATION_WORDS = {
+    "不", "没", "无", "非", "莫", "弗", "勿", "未", "否", "别", 
+    "不是", "不要", "没有", "难以", "未曾", "毫无", "摒弃", "休", "未必",
+    "并非", "绝不", "从未", "切忌", "严禁"
+}
 
-def load_words_from_sheet(xls: pd.ExcelFile, sheet_name: str) -> Set[str]:
-    # 容错读取 sheet
-    real_sheet_name = sheet_name
-    if sheet_name not in xls.sheet_names:
-        for s in xls.sheet_names:
-            if s.lower() == sheet_name.lower():
-                real_sheet_name = s
-                break
+# 否定作用窗口：只在情感词前若干个分词内寻找否定词，避免远距离误伤
+NEG_WINDOW = 6
+
+# 语气缓和/边际改善修饰词：修正“衰退放缓 / 降幅收窄 / 压力缓解”等被词袋法误判的问题
+# 这些词往往表示“坏消息在减弱/改善”，应当削弱负向强度（而不是简单翻正）。
+IMPROVE_MODIFIERS = {
+    "放缓", "趋缓", "缓解", "减轻", "收窄", "缩小", "企稳", "趋稳", "稳定", "温和",
+    "改善", "好转", "回升", "回稳", "修复", "回暖",
+}
+
+# 坏语境触发词 (如 CPI/通胀/价格...)：用于“上涨”在该语境下转为坏消息的修正
+BAD_CONTEXT_WORDS = {"CPI", "PPI", "物价", "通胀", "价格", "赤字", "不良", "坏账", "杠杆", "风险", "泡沫"}
+
+# 通用“量增/上行”词：在 CPI/通胀语境中往往是坏消息
+VOLUME_UP_WORDS = {"上涨", "上升", "增加", "增高", "攀升", "走高", "上行", "抬升", "反弹", "回升", "新高", "扩大"}
+
+# CPI/通胀话题采用“目标导向”而不是“通用正负面”：
+#  - 价格上行（上涨/攀升/反弹）通常是坏消息
+#  - 价格回落/温和/稳定通常是好消息
+CPI_TOPIC_WORDS = {"CPI", "PPI", "通胀", "物价", "价格", "居民消费价格", "生产者价格", "工业品出厂价格"}
+CPI_BAD_WORDS = {"上涨", "上升", "攀升", "走高", "抬升", "反弹", "回升", "上行", "新高", "高位", "严重"}
+CPI_GOOD_WORDS = {"回落", "下降", "下行", "走低", "降低", "温和", "稳定", "企稳", "趋稳", "缓解", "趋缓", "收窄"}
+
+# 负向词碰到“边际改善修饰词”时，削弱强度（而不是直接翻正），更稳健。
+NEG_IMPROVE_ATTENUATION = 0.5
+
+def load_excel_dictionary():
+    """
+    直接读取 Excel 并合并所有 Sheet
+    """
+    print(f"[Dict] Reading {DICT_FILE} ...")
+    if not Path(DICT_FILE).exists():
+        print(f"❌ Error: {DICT_FILE} not found!")
+        sys.exit(1)
+
+    word_dict = {} 
     
-    if real_sheet_name not in xls.sheet_names:
-        print(f"[ERROR] Sheet '{sheet_name}' not found!")
-        return set()
-
-    df = pd.read_excel(xls, sheet_name=real_sheet_name)
-    col = df.columns[0]
-    words = df[col].dropna().astype(str).str.strip().tolist()
-    return set(words)
-
-print("[INFO] Loading Du sentiment dictionary from:", DICT_PATH)
-try:
-    xls_du = pd.ExcelFile(DICT_PATH)
-    POS_DU = load_words_from_sheet(xls_du, "Positive")
-    NEG_DU = load_words_from_sheet(xls_du, "Negative")
-    print(f"[INFO] Positive words: {len(POS_DU)}")
-    print(f"[INFO] Negative words: {len(NEG_DU)}")
-except Exception as e:
-    print(f"[ERROR] Loading Dictionary Failed: {e}")
-    POS_DU, NEG_DU = set(), set()
-
-# 否定词
-NEGATION_WORDS = set(["不", "非", "没", "沒有", "无", "未", "莫", "勿", "难以", "并未", "不再", "无法", "未能"])
-
-# 停用词
-STOP_WORDS = set(["的", "了", "在", "是", "和", "与", "对", "等", "及", "之", "其", "于", "但", "则", "所", "，", "。", "、", "：", "；", "！", "？", "（", "）", "“", "”", "%"])
-
-# 【保留精华】反转短语 (Reversal Phrases)
-# 这些词虽然含负面字，但在央行报告中通常是好事，给予加分
-REVERSAL_PHRASES = [
-    "降幅收窄", "降幅缩小", "跌幅收窄", "止跌回升", 
-    "由负转正", "低位回升", "触底反弹", "增速回升",
-    "负增长收窄", "亏损减少", "降幅明显收窄"
-]
-
-# ========= 2. 句子打分核心函数 =========
-
-def score_sentence_optimized(text: str) -> pd.Series:
-    text_str = str(text).strip()
-    if not text_str:
-        return pd.Series({"Pos":0, "Neg":0, "Neg_net":0, "is_numeric":0})
-
-    # 1. 反转短语检测 (Bonus)
-    reversal_bonus = 0
-    for phrase in REVERSAL_PHRASES:
-        if phrase in text_str:
-            reversal_bonus += 1.0 # 视为正向信号
-
-    # 2. 分词
-    tokens = list(jieba.cut(text_str))
-    if not tokens:
-        return pd.Series({"Pos":0, "Neg":0, "Neg_net":0, "is_numeric":0})
-
-    pos_cnt = 0 + reversal_bonus
-    neg_cnt = 0
-    valid_tokens_count = 0
-
-    for idx, w in enumerate(tokens):
-        w = w.strip()
-        if not w: continue
-        if w in STOP_WORDS: continue
-
-        valid_tokens_count += 1
-
-        # 否定检查
-        is_negated = False
-        if idx > 0:
-            prev = tokens[idx - 1].strip()
-            if prev in NEGATION_WORDS:
-                is_negated = True
+    try:
+        # 读取所有 Sheet
+        xls = pd.read_excel(DICT_FILE, sheet_name=None)
         
-        # Du 词典匹配
-        if w in POS_DU:
-            if is_negated: neg_cnt += 1
-            else:          pos_cnt += 1
-        elif w in NEG_DU:
-            if is_negated: pos_cnt += 1
-            else:          neg_cnt += 1
+        for sheet_name, df in xls.items():
+            if df.empty: continue
+            
+            # 尝试获取第一列数据 (无论列名是什么)
+            words = df.iloc[:, 0].dropna().astype(str).str.strip()
+            
+            # 判定 Sheet 类型
+            lower_name = sheet_name.lower()
+            
+            weight = 0
+            label = "Unknown"
+            
+            if "pos" in lower_name or "正面" in lower_name:
+                weight = 1
+                label = "Positive"
+            elif "pol" in lower_name or "政治" in lower_name:
+                weight = 1 # 政治词视为正面
+                label = "Political"
+            elif "neg" in lower_name or "负面" in lower_name:
+                weight = -1
+                label = "Negative"
+            else:
+                print(f"  ⚠️ Skipping unknown sheet: {sheet_name}")
+                continue
+                
+            count = 0
+            for w in words:
+                # 简单清洗：跳过太短的或者是表头
+                if len(w) > 0 and w.lower() != 'word': 
+                    word_dict[w] = weight
+                    count += 1
+            
+            print(f"  - Sheet '{sheet_name}' -> Merged as {label} ({count} words)")
+            
+    except Exception as e:
+        print(f"❌ Error reading Excel: {e}")
+        sys.exit(1)
 
-    # 3. 计算分数
-    total = max(valid_tokens_count, 1)
-    pos_pct = pos_cnt / total
-    neg_pct = neg_cnt / total
-    neg_net = neg_pct - pos_pct # 越大越负面
+    # === 手动补全缺失的关键金融词汇 ===
+    # 针对用户反馈的 "增长: Not Found" 问题
+    critical_positives = ["增长", "回升", "好转", "改善", "复苏", "繁荣", "稳健", "优化", "合理"]
+    critical_negatives = ["衰退", "下滑", "萎缩", "低迷", "恶化", "疲软", "短缺", "不足", "困难"]
+    
+    print("\n[Dict Supplement]")
+    for w in critical_positives:
+        if w not in word_dict:
+            word_dict[w] = 1
+            print(f"  + Added missing positive: {w}")
+            
+    for w in critical_negatives:
+        if w not in word_dict:
+            word_dict[w] = -1
+            print(f"  + Added missing negative: {w}")
 
-    # 4. 数字句标记
-    digit_count = sum(c.isdigit() for c in text_str)
-    is_numeric = 1 if (len(text_str) > 0 and digit_count / len(text_str) > 0.15) else 0
+    print(f"  => Total unique sentiment words loaded: {len(word_dict)}")
+    
+    # === 自检 ===
+    print("[Self-Check]")
+    for w in ["上涨", "风险", "增长", "物价"]:
+        status = f"✅ Score {word_dict.get(w)}" if w in word_dict else "❌ Not Found"
+        print(f"  - '{w}': {status}")
+        
+    return word_dict
 
+def calculate_jiang_tone_strict(text, word_dict):
+    """
+    姜富伟情感单元法 (完美复现版)
+    """
+    if not isinstance(text, str): 
+        return pd.Series({"dict_tone": 0, "is_valid_unit": 0})
+    
+    # 1. 预清洗
+    digit_count = sum(c.isdigit() for c in text)
+    if len(text) > 0 and (digit_count / len(text) > DIGIT_THRESHOLD):
+        return pd.Series({"dict_tone": 0, "is_valid_unit": 0})
+    
+    # 2. 分词
+    words = jieba.lcut(text)
+    if len(words) == 0: 
+        return pd.Series({"dict_tone": 0, "is_valid_unit": 0})
+
+    # 主题识别：CPI/通胀话题采用“目标导向”方向（价格上行偏负、回落/稳定偏正）
+    is_cpi_topic = any(w in CPI_TOPIC_WORDS for w in words)
+    
+    # 3. 锚点定位
+    sentiment_hits = []
+    for i, w in enumerate(words):
+        if w in word_dict:
+            sentiment_hits.append((i, w, word_dict[w]))
+            
+    if not sentiment_hits:
+        return pd.Series({"dict_tone": 0, "is_valid_unit": 1}) 
+    
+    total_score = 0
+    prev_idx = -1 
+    
+    # 4. 核心循环：动态区间扫描
+    for curr_idx, word, raw_weight in sentiment_hits:
+        
+        current_weight = raw_weight
+
+        # --- 逻辑 A1: CPI/通胀话题“目标导向”修正 ---
+        # 关键：在 CPI 话题内，“上涨/攀升/反弹...”应视为负面，“回落/稳定/温和...”应视为正面。
+        if is_cpi_topic:
+            if word in CPI_BAD_WORDS:
+                current_weight = -1 # 强制转负 (CPI上涨)
+            elif word in CPI_GOOD_WORDS:
+                current_weight = 1  # 强制转正 (CPI回落)
+
+        # --- 逻辑 A2: 语境修正（非 CPI 话题也可触发）：坏语境 + 上行词 => 更偏负 ---
+        # 例如“通胀压力反弹/物价上涨”
+        # 只有当 current_weight 还是 1 时才检查，避免已经转负的被重复处理
+        if current_weight == 1 and word in VOLUME_UP_WORDS:
+            start_check = max(0, curr_idx - 5)
+            context_window = words[start_check:curr_idx]
+            # 检查是否有坏词 (Substring match for robustness)
+            has_bad_context = False
+            for w in context_window:
+                for bad in BAD_CONTEXT_WORDS:
+                    if bad in w:
+                        has_bad_context = True
+                        break
+                if has_bad_context: break
+            
+            if has_bad_context:
+                current_weight = -1
+
+        # --- 逻辑 A3: 边际改善修饰词削弱负向强度 ---
+        # 例如“衰退放缓/下滑收窄/压力缓解/降幅收窄”
+        if current_weight < 0:
+            right_window = words[curr_idx + 1: min(len(words), curr_idx + 1 + 3)]
+            left_window = words[max(0, curr_idx - 3): curr_idx]
+            has_improvement = False
+            for w in right_window + left_window:
+                if w in IMPROVE_MODIFIERS:
+                    has_improvement = True
+                    break
+            
+            if has_improvement:
+                current_weight = current_weight * NEG_IMPROVE_ATTENUATION
+
+        # --- 逻辑 B: 否定词翻转（缩小作用范围，避免远距离误伤） ---
+        # 姜富伟原始是“上一个情感词到当前情感词之间扫描”。这里保留思想但只取最近 NEG_WINDOW 个词。
+        seg_start = max(prev_idx + 1, curr_idx - NEG_WINDOW)
+        scan_segment = words[seg_start:curr_idx]
+        neg_count = sum(1 for w in scan_segment if w in NEGATION_WORDS)
+        
+        # 极性翻转公式: Weight * (-1)^n
+        final_weight = current_weight * ((-1) ** neg_count)
+        
+        total_score += final_weight
+        prev_idx = curr_idx
+        
+    # 5. 归一化
+    tone = total_score / len(words)
+    
     return pd.Series({
-        "Pos": pos_pct,
-        "Neg": neg_pct,
-        "Neg_net": neg_net,
-        "is_numeric": is_numeric
+        "dict_tone": tone,
+        "is_valid_unit": 1
     })
 
-# ========= 3. 主流程 =========
-
 def main():
-    print(f"[INFO] Processing {SENT_PATH} ...")
-    df_sent = pd.read_csv(SENT_PATH)
+    print("==================================================")
+    print("   Running Jiang Fuwei Method (Excel Direct Read)")
+    print("==================================================")
     
-    # 清洗
-    df_sent[TEXT_COL] = df_sent[TEXT_COL].astype(str).str.strip()
-    df_sent = df_sent[df_sent[TEXT_COL] != ""].reset_index(drop=True)
+    # 1. 读取 Excel 词典
+    word_dict = load_excel_dictionary()
+    
+    # 2. 读取句子
+    print(f"\n[Data] Reading {SENT_PATH} ...")
+    try:
+        df = pd.read_csv(SENT_PATH)
+        df["text"] = df["text"].astype(str)
+    except FileNotFoundError:
+        print(f"❌ Error: {SENT_PATH} not found.")
+        sys.exit(1)
+        
+    # 3. 计算打分
+    print(f"[Calc] Scoring {len(df)} sentences...")
+    tqdm.pandas()
+    scores = df["text"].progress_apply(lambda x: calculate_jiang_tone_strict(x, word_dict))
+    
+    df = pd.concat([df, scores], axis=1)
+    
+    # 4. 输出
+    df_valid = df[df["is_valid_unit"] == 1].copy()
+    
+    print(f"\n[Result]")
+    print(f"  - Valid units retained: {len(df_valid)}")
+    
+    # 检查非零分
+    non_zero = (df_valid["dict_tone"] != 0).sum()
+    print(f"  - Non-zero score sentences: {non_zero}")
+    
+    if non_zero == 0:
+        print("⚠️ WARNING: All scores are 0! Dictionary matching failed.")
+    else:
+        print("✅ Success: Scores generated.")
 
-    print("[INFO] Scoring sentences (Du Dictionary + Logic Fixes)...")
-    scores = df_sent[TEXT_COL].apply(score_sentence_optimized)
-    
-    df_all = pd.concat([df_sent, scores], axis=1)
-    
-    # 保存结果 (供 RoBERTa 使用)
-    df_all.to_csv(OUT_SENT_PATH, index=False, encoding="utf-8-sig")
-    print(f"[OK] Saved sentence scores: {OUT_SENT_PATH}")
-
-    # 自检
-    print("\n>>> Check Positive Samples (Lowest Neg_net):")
-    print(df_all.sort_values("Neg_net").head(3)[TEXT_COL].values)
-    
-    print("\n>>> Check Negative Samples (Highest Neg_net):")
-    print(df_all.sort_values("Neg_net", ascending=False).head(3)[TEXT_COL].values)
-
-    # 聚合季度数据
-    if YEAR_COL in df_all.columns and QUARTER_COL in df_all.columns:
-        df_q = df_all.groupby([YEAR_COL, QUARTER_COL], as_index=False)[["Pos", "Neg", "Neg_net"]].mean()
-        df_q.to_csv(OUT_TONE_Q_PATH, index=False, encoding="utf-8-sig")
-        print(f"[OK] Saved quarterly tone: {OUT_TONE_Q_PATH}")
+    df_valid.to_csv(OUT_SENT_PATH, index=False, encoding="utf-8-sig")
+    print(f"Saved to: {OUT_SENT_PATH}")
 
 if __name__ == "__main__":
     main()

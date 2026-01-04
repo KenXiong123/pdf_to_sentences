@@ -1,0 +1,135 @@
+============================================================
+EGARCH-X results (aligned with Jiang Fuwei's framework)
+Index: HS300 
+ARMA_MODE: fixed 
+ARMA used: 2 , 1 
+Mean regressors used: S_gdp, S_policy, tone_p90_policy_z 
+Variance regressors used: D_report, Readability, Similarity 
+============================================================
+
+
+*---------------------------------*
+*          GARCH Model Fit        *
+*---------------------------------*
+
+Conditional Variance Dynamics 	
+-----------------------------------
+GARCH Model	: eGARCH(1,1)
+Mean Model	: ARFIMA(2,0,1)
+Distribution	: std 
+
+Optimal Parameters
+------------------------------------
+        Estimate  Std. Error     t value Pr(>|t|)
+mu      0.038165    0.016225     2.35226 0.018660
+ar1    -0.843216    0.054580   -15.44905 0.000000
+ar2    -0.007767    0.014525    -0.53473 0.592838
+ma1     0.849173    0.051427    16.51215 0.000000
+mxreg1  0.129502    0.333395     0.38843 0.697694
+mxreg2 -0.186553    0.185447    -1.00597 0.314432
+mxreg3  0.191614    0.250221     0.76578 0.443808
+omega   0.007602    0.002295     3.31309 0.000923
+alpha1 -0.005608    0.007639    -0.73409 0.462893
+beta1   0.992106    0.000021 46298.46859 0.000000
+gamma1  0.147901    0.003901    37.91600 0.000000
+vxreg1 -0.100151    0.097857    -1.02344 0.306099
+vxreg2 -0.047610    0.084623    -0.56261 0.573698
+vxreg3 -0.064137    0.068286    -0.93924 0.347608
+shape   5.277387    0.421470    12.52140 0.000000
+
+Robust Standard Errors:
+        Estimate  Std. Error     t value Pr(>|t|)
+mu      0.038165    0.018548     2.05766 0.039623
+ar1    -0.843216    0.025452   -33.13018 0.000000
+ar2    -0.007767    0.012233    -0.63491 0.525485
+ma1     0.849173    0.019182    44.27016 0.000000
+mxreg1  0.129502    0.311194     0.41615 0.677304
+mxreg2 -0.186553    0.226128    -0.82499 0.409379
+mxreg3  0.191614    0.472899     0.40519 0.685338
+omega   0.007602    0.002311     3.29011 0.001001
+alpha1 -0.005608    0.009610    -0.58353 0.559534
+beta1   0.992106    0.000024 41419.14216 0.000000
+gamma1  0.147901    0.003591    41.18131 0.000000
+vxreg1 -0.100151    0.089412    -1.12010 0.262670
+vxreg2 -0.047610    0.071792    -0.66317 0.507222
+vxreg3 -0.064137    0.062988    -1.01824 0.308566
+shape   5.277387    0.436806    12.08176 0.000000
+
+LogLikelihood : -8025.747 
+
+Information Criteria
+------------------------------------
+                   
+Akaike       3.4362
+Bayes        3.4569
+Shibata      3.4362
+Hannan-Quinn 3.4435
+
+Weighted Ljung-Box Test on Standardized Residuals
+------------------------------------
+                         statistic   p-value
+Lag[1]                        6.41 1.135e-02
+Lag[2*(p+q)+(p+q)-1][8]      17.64 0.000e+00
+Lag[4*(p+q)+(p+q)-1][14]     24.64 3.314e-08
+d.o.f=3
+H0 : No serial correlation
+
+Weighted Ljung-Box Test on Standardized Squared Residuals
+------------------------------------
+                        statistic   p-value
+Lag[1]                      7.426 6.429e-03
+Lag[2*(p+q)+(p+q)-1][5]    21.767 6.313e-06
+Lag[4*(p+q)+(p+q)-1][9]    25.294 8.184e-06
+d.o.f=2
+
+Weighted ARCH LM Tests
+------------------------------------
+            Statistic Shape Scale P-Value
+ARCH Lag[3]     4.728 0.500 2.000 0.02967
+ARCH Lag[5]     8.020 1.440 1.667 0.01984
+ARCH Lag[7]     8.556 2.315 1.543 0.03941
+
+Nyblom stability test
+------------------------------------
+Joint Statistic:  4.6854
+Individual Statistics:              
+mu     1.53647
+ar1    0.49654
+ar2    0.45096
+ma1    0.51592
+mxreg1 0.07493
+mxreg2 0.12436
+mxreg3 0.21875
+omega  0.66176
+alpha1 0.14698
+beta1  0.86900
+gamma1 0.36467
+vxreg1 0.52236
+vxreg2 0.31908
+vxreg3 0.06732
+shape  0.23989
+
+Asymptotic Critical Values (10% 5% 1%)
+Joint Statistic:     	 3.26 3.54 4.07
+Individual Statistic:	 0.35 0.47 0.75
+
+Sign Bias Test
+------------------------------------
+                   t-value   prob sig
+Sign Bias           1.1073 0.2682    
+Negative Sign Bias  1.5936 0.1111    
+Positive Sign Bias  0.9244 0.3553    
+Joint Effect        3.4131 0.3322    
+
+
+Adjusted Pearson Goodness-of-Fit Test:
+------------------------------------
+  group statistic p-value(g-1)
+1    20     34.05    0.0181233
+2    30     59.50    0.0007125
+3    40     59.91    0.0172307
+4    50     63.61    0.0783413
+
+
+Elapsed time : 1.333412 
+

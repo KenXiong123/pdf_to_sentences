@@ -1,235 +1,216 @@
+# roberta_pipeline.py
+# -*- coding: utf-8 -*-
+"""
+Step 2 (M1 Max Optimized): 深度学习情感分析 (MacBERT Large)
+硬件优化：
+1. [Tokenization] 开启 num_proc=8 多核并行。
+2. [Training] 开启 dataloader_num_workers=4 实现 CPU/GPU 流水线。
+3. [MPS] 强制使用 Metal Performance Shaders 加速。
+"""
+
 import argparse
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-
 import torch
-from datasets import load_dataset
+from datasets import Dataset
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     Trainer,
     TrainingArguments,
+    DataCollatorWithPadding
 )
+import os
+import sys
 
 # ================== 配置区域 ==================
-# 1. 预训练 RoBERTa 模型名
-MODEL_NAME = "hfl/chinese-roberta-wwm-ext"
+MODEL_NAME = "hfl/chinese-macbert-large"
 
-# 2. 文件路径（按你的实际文件名改）
-ALL_SENTENCES_WITH_DICT = "all_sentences_with_dict_scores.csv"  # 有 Neg_net 的句子文件
-ALL_SENTENCES_RAW = "all_sentences.csv"                         # 如果你只想基于原句子打分，也可以换成上一个
-TRAIN_CSV = "roberta_train_sentences.csv"                       # 中间产物：弱标签训练集
-MODEL_DIR = "roberta_pbc_sentiment"                             # 微调后的模型保存目录
-SCORED_CSV = "all_sentences_with_roberta_score.csv"             # 输出：带 roberta_neg_prob 的文件
+# 文件路径
+ALL_SENTENCES_WITH_DICT = "all_sentences_with_dict_scores.csv"
+ALL_SENTENCES_RAW = "all_sentences.csv"
+TRAIN_CSV = "macbert_train_clean.csv"
+MODEL_DIR = "macbert_pbc_sentiment_v2"
+SCORED_CSV = "all_sentences_with_roberta_score.csv"
 
+# M1 Max 专属超参
 MAX_LEN = 128
-BATCH_SIZE = 64
-# ============================================================
+# M1 Max 统一内存很大(32G/64G)，Batch 可以给大一点，如果崩了就改回 16
+BATCH_SIZE = 32          
+GRAD_ACCUMULATION = 2    # 等效 Batch = 64
+LEARNING_RATE = 2e-5
+EPOCHS = 3
+CONFIDENCE_MARGIN = 0.0 
 
+# 并行设置
+NUM_PROC = 8             # Tokenize 时的 CPU 核心数
+NUM_WORKERS = 4          # DataLoader 的子进程数
+# ============================================
 
-# ========= 阶段 1：用 Neg_net 生成弱标签训练集 =========
-def is_training_worthy(text: str) -> bool:
-    """
-    过滤掉那种纯数据罗列、报账型句子，避免当成强烈情绪样本。
-    策略：数字字符占比 > 15% 的句子，直接踢出训练集。
-    你以后觉得太宽/太窄，可以把 0.15 调一下。
-    """
-    if not isinstance(text, str) or not text:
-        return False
-    num_count = sum(c.isdigit() for c in text)
-    if num_count / len(text) > 0.15:
-        return False
-    return True
+def get_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
+def prepare_training_data():
+    print(f"[Step 2-A] 准备训练数据...")
+    if not os.path.exists(ALL_SENTENCES_WITH_DICT):
+        print(f"❌ 错误：找不到文件 {ALL_SENTENCES_WITH_DICT}")
+        sys.exit(1)
 
-def prepare_dataset():
     df = pd.read_csv(ALL_SENTENCES_WITH_DICT)
+    
+    # 过滤与清洗
+    if 'is_valid_unit' in df.columns:
+        clean_df = df[df['is_valid_unit'] == 1].copy()
+    else:
+        clean_df = df[df['is_numeric'] == 0].copy()
+            
+    clean_df = clean_df[clean_df['text'].str.len() > 4]
+    high_conf_df = clean_df[abs(clean_df['dict_tone']) > CONFIDENCE_MARGIN].copy()
+    
+    # 标签生成
+    high_conf_df['label'] = high_conf_df['dict_tone'].apply(lambda x: 0 if x > 0 else 1)
+    
+    # 均衡采样
+    pos_df = high_conf_df[high_conf_df['label'] == 0]
+    neg_df = high_conf_df[high_conf_df['label'] == 1]
+    
+    min_len = min(len(pos_df), len(neg_df))
+    if min_len < 10:
+        print("❌ Error: 样本太少。")
+        sys.exit(1)
 
-    # 1. 文本列名（根据实际改）
-    text_col = "text"
-    if text_col not in df.columns:
-        raise ValueError(f"找不到 {text_col} 列，请检查 {ALL_SENTENCES_WITH_DICT} 的列名。")
+    print(f"   - 均衡采样: 各 {min_len} 条")
+    balanced_df = pd.concat([
+        pos_df.sample(n=min_len, random_state=42),
+        neg_df.sample(n=min_len, random_state=42)
+    ]).sample(frac=1, random_state=42)
+    
+    balanced_df.to_csv(TRAIN_CSV, index=False, encoding="utf-8-sig")
+    print(f"[OK] 训练集准备完毕。")
 
-    df[text_col] = df[text_col].astype(str).str.strip()
-    df = df[df[text_col].str.len() >= 5].copy()  # 去掉太短的句子
-
-    if "Neg_net" not in df.columns:
-        raise ValueError("找不到 Neg_net 列，请确认前面词典打分结果里有该列。")
-
-    # 2. 先过滤掉纯数字/报账型句子，减少噪音
-    df = df[df[text_col].apply(is_training_worthy)].copy()
-
-    score = df["Neg_net"].astype(float)
-
-    # 3. 用更收紧的分位数阈值选出“非常极端”的正负句子（10%/90%）
-    q_low, q_high = score.quantile([0.1, 0.9])
-    print(f"[INFO] Neg_net 10% 分位: {q_low:.4f}, 90% 分位: {q_high:.4f}")
-
-    # Neg_net 低 = 负面程度低（更正向），打 label=0
-    df_pos = df[score <= q_low].copy()
-    df_pos["label"] = 0  # 0 = 正向（负面词少）
-
-    # Neg_net 高 = 负面程度高，打 label=1
-    df_neg = df[score >= q_high].copy()
-    df_neg["label"] = 1  # 1 = 负向（负面词多）
-
-    # 4. 正负样本数量平衡
-    min_len = min(len(df_pos), len(df_neg))
-    df_pos = df_pos.sample(n=min_len, random_state=42)
-    df_neg = df_neg.sample(n=min_len, random_state=42)
-
-    data = pd.concat([df_pos, df_neg], ignore_index=True)
-    data = data.sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-    print("[INFO] 正样本数量( label=0 ):", (data["label"] == 0).sum())
-    print("[INFO] 负样本数量( label=1 ):", (data["label"] == 1).sum())
-
-    data[[text_col, "label"]].to_csv(TRAIN_CSV, index=False, encoding="utf-8-sig")
-    print(f"[OK] 训练集已保存到 {TRAIN_CSV}")
-
-
-# ========= 阶段 2：微调 RoBERTa 情绪模型 =========
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=1)
-    return {
-        "accuracy": accuracy_score(labels, preds),
-        "f1": f1_score(labels, preds),
-    }
-
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    acc = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average="binary")
+    return {"accuracy": acc, "f1": f1}
 
 def train_model():
-    # 1. 加载训练集
-    raw_dset = load_dataset("csv", data_files={"train": TRAIN_CSV})
-    dset = raw_dset["train"].train_test_split(test_size=0.1, seed=42)
-
+    print(f"[Step 2-B] 开始微调 (M1 Max Mode)...")
+    if not os.path.exists(TRAIN_CSV):
+        prepare_training_data()
+        
+    df = pd.read_csv(TRAIN_CSV)
+    train_size = int(0.9 * len(df))
+    train_df = df.iloc[:train_size]
+    eval_df = df.iloc[train_size:]
+    
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    def tokenize(batch):
-        return tokenizer(
-            batch["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_LEN,
-        )
-
-    tokenized = dset.map(tokenize, batched=True)
-    tokenized = tokenized.remove_columns(["text"])
-    tokenized.set_format("torch")
-
-    # 2. 加载预训练 RoBERTa
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=2
-    )
-
-    # 3. 设置训练参数
+    
+    def tokenize_func(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=MAX_LEN)
+    
+    # 🔥 优化1: 多核并行 Tokenize
+    print(f"   - Tokenizing with {NUM_PROC} cores...")
+    train_ds = Dataset.from_pandas(train_df).map(tokenize_func, batched=True, num_proc=NUM_PROC)
+    eval_ds = Dataset.from_pandas(eval_df).map(tokenize_func, batched=True, num_proc=NUM_PROC)
+    
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
+    
+    # 🔥 优化2: DataLoader 并行
     args = TrainingArguments(
         output_dir=MODEL_DIR,
-        learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=32,
-        num_train_epochs=3,
         eval_strategy="epoch",
         save_strategy="epoch",
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUMULATION,
+        num_train_epochs=EPOCHS,
+        weight_decay=0.01,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
-        logging_steps=50,
+        use_mps_device=(get_device() == "mps"),
+        logging_steps=20,
+        save_total_limit=2,
+        # 关键并行参数
+        dataloader_num_workers=NUM_WORKERS, 
+        dataloader_pin_memory=True
     )
-
+    
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=tokenized["train"],
-        eval_dataset=tokenized["test"],
-        compute_metrics=compute_metrics,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        tokenizer=tokenizer,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        compute_metrics=compute_metrics
     )
-
-    # 4. 训练
+    
     trainer.train()
-
-    # 5. 保存最优模型和 tokenizer
     trainer.save_model(MODEL_DIR)
     tokenizer.save_pretrained(MODEL_DIR)
-    print(f"[OK] 模型已保存到 {MODEL_DIR}")
+    print(f"[OK] 模型微调完成。")
 
-
-# ========= 阶段 3：用训练好的模型给所有句子打分 =========
-def score_sentences():
-    # 你可以用 all_sentences_with_dict_scores.csv 或 all_sentences.csv
-    df = pd.read_csv(ALL_SENTENCES_WITH_DICT)
-
-    text_col = "text"
-    if text_col not in df.columns:
-        raise ValueError(f"找不到 {text_col} 列，请检查 {ALL_SENTENCES_WITH_DICT} 的列名。")
-
-    df[text_col] = df[text_col].astype(str).str.strip().fillna("")
-
+def score_all_sentences():
+    print(f"[Step 2-C] 全量预测 (High Performance)...")
+    
+    if not os.path.exists(ALL_SENTENCES_RAW):
+        sys.exit(1)
+        
+    df = pd.read_csv(ALL_SENTENCES_RAW).dropna(subset=["text"])
+    texts = df["text"].astype(str).tolist()
+    
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-    model.eval()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    device = torch.device(get_device())
+    print(f"   - Device: {device}")
     model.to(device)
-    print(f"[INFO] 使用设备: {device}")
-
+    model.eval()
+    
+    # 🔥 优化3: 手动构建简单的 DataLoader 来利用多进程加载
+    # 虽然这里数据量不大，但为了规范，我们可以简单地做批量处理
+    
     probs = []
-    texts = df[text_col].tolist()
-
-    for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Scoring"):
-        batch_texts = texts[i:i + BATCH_SIZE]
-        enc = tokenizer(
-            batch_texts,
-            padding=True,
-            truncation=True,
-            max_length=MAX_LEN,
-            return_tensors="pt",
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-
+    # 推理 Batch 增大
+    infer_batch = 64 
+    
+    for i in tqdm(range(0, len(texts), infer_batch), desc="Inference"):
+        batch_text = texts[i : i+infer_batch]
+        inputs = tokenizer(batch_text, padding=True, truncation=True, max_length=MAX_LEN, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
         with torch.no_grad():
-            logits = model(**enc).logits
-            # label=1 代表负面，取负面概率
-            batch_probs = torch.softmax(logits, dim=1)[:, 1]
-            probs.extend(batch_probs.cpu().numpy().tolist())
-
+            outputs = model(**inputs)
+            scores = torch.softmax(outputs.logits, dim=1)
+            neg_probs = scores[:, 1].cpu().numpy()
+            probs.extend(neg_probs)
+            
     df["roberta_neg_prob"] = probs
     df.to_csv(SCORED_CSV, index=False, encoding="utf-8-sig")
-    print(f"[OK] 已将 RoBERTa 情绪分数写入 {SCORED_CSV}")
-
-
-# ========= 命令行入口 =========
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="RoBERTa 情绪分析流水线：prepare/train/score/all"
-    )
-    parser.add_argument(
-        "--stage",
-        type=str,
-        default="all",
-        choices=["prepare", "train", "score", "all"],
-        help="要执行的阶段：prepare(构建训练集)/train(训练模型)/score(打分)/all(全部顺序执行)",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    if args.stage in ("prepare", "all"):
-        print("==== 阶段 1：准备弱监督训练集 ====")
-        prepare_dataset()
-
-    if args.stage in ("train", "all"):
-        print("==== 阶段 2：微调 RoBERTa 模型 ====")
-        train_model()
-
-    if args.stage in ("score", "all"):
-        print("==== 阶段 3：用模型为所有句子打分 ====")
-        score_sentences()
-
+    print(f"[Success] 结果已保存: {SCORED_CSV}")
 
 if __name__ == "__main__":
-    main()
+    # Mac 上多进程需要设置 start_method
+    try:
+        import torch.multiprocessing as mp
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", default="all", choices=["prepare", "train", "score", "all"])
+    args = parser.parse_args()
+    
+    if args.stage in ["prepare", "all"]:
+        prepare_training_data()
+    if args.stage in ["train", "all"]:
+        train_model()
+    if args.stage in ["score", "all"]:
+        score_all_sentences()

@@ -1,251 +1,267 @@
 # build_egarch_dataset.py
 # -*- coding: utf-8 -*-
+"""
+构建 EGARCH 回归用的日度数据集：egarch_daily_data_roberta.csv
 
-from __future__ import annotations
-import pandas as pd
+输入文件（文件名保持不变）：
+- daily_returns_4idx.csv
+- macro_controls_daily.csv
+- gdp_events.csv
+- policy_events.csv
+- report_dates.csv
+- tone_by_quarter_roberta.csv
+
+核心口径（新变量）：
+- 文本变量（季度）：tone_p90_policy_z, tone_p90_macro_z, tone_p90_all_z
+- 文本质量（季度）：Similarity, Readability（由 similarity_prev / avg_sent_len 构造并在季度层 Z-score）
+- 事件映射：strict next trading day（即使 event_date 本身是交易日，也映射到下一交易日）
+- 报告窗口：可扩展到 t..t+W（默认 W=0）。为了避免“窗口越大冲击越大”，会对连续变量做等分缩放。
+
+输出列至少包含（供 run_egarch.r 使用）：
+date, SH, SZ, HS300, CSI500,
+S_gdp, D_gdp, S_policy, D_policy,
+D_report, Similarity, Readability,
+tone_p90_policy_z, tone_p90_macro_z, tone_p90_all_z
+"""
+
+import os
 import numpy as np
-from pathlib import Path
+import pandas as pd
+
+RET_FILE    = "daily_returns_4idx.csv"
+MACRO_FILE  = "macro_controls_daily.csv"
+GDP_FILE    = "gdp_events.csv"
+POLICY_FILE = "policy_events.csv"
+REPORT_FILE = "report_dates.csv"
+TONEQ_FILE  = "tone_by_quarter_roberta.csv"
+OUT_FILE    = "egarch_daily_data_roberta.csv"
+
+# ===== 可调参数 =====
+# 报告窗口向后扩展天数：0=只在反应日（t）有冲击；1= t 与 t+1；2= t..t+2
+REPORT_WINDOW_FORWARD = 0
+# 连续变量（tone/Similarity/Readability/D_report）在窗口内的分配方式：
+# - "equal": 等分到窗口每一天（总冲击守恒，推荐）
+# - "none" : 每一天都赋同一个值（会放大总冲击，不推荐）
+WINDOW_SCALE = "equal"
+# ====================
 
 
-# =========================
-# 配置：文件名（默认都在 scripts/ 下）
-# =========================
-DAILY_RETURNS = "daily_returns_4idx.csv"
-MACRO_CONTROLS = "macro_controls_daily.csv"
-TONE_QUARTER = "tone_by_quarter_roberta.csv"
-REPORT_DATES = "report_dates.csv"
-GDP_EVENTS = "gdp_events.csv"
-POLICY_EVENTS = "policy_events.csv"
-
-OUT_FILE = "egarch_daily_data_roberta.csv"
-
-# 映射“事件自然日 -> 交易日”的规则：
-# False = 严格用下一交易日（date > event_date）
-# True  = 如果事件日当天就是交易日，则用当天（date >= event_date）
-INCLUDE_SAME_DAY = False  # legacy (unused; kept for backward compat)
-REPORT_INCLUDE_SAME_DAY = True   # 报告：若发布日是交易日则用当日，否则映射到下一交易日
-GDP_INCLUDE_SAME_DAY = True      # GDP：同上（若公告日是交易日则用当日）
-POLICY_INCLUDE_SAME_DAY = True   # 政策公告：同上（事件日是交易日则用当日）
-
-# 分布滞后：为 tone 构造 L1..LK（交易日滞后）
-# 建议 K=2 或 3；K 越大，事件稀疏时估计更不稳。
-TONE_LAGS = 3
-
-
-def _resolve(path: str) -> Path:
-    """优先 scripts/，否则 code/data/，否则 code/"""
-    script_dir = Path(__file__).resolve().parent
-    base_dir = script_dir.parent
-
-    cands = [
-        script_dir / path,
-        base_dir / "data" / path,
-        base_dir / path,
-    ]
-    for p in cands:
-        if p.exists():
-            return p
-    raise FileNotFoundError(f"找不到文件: {path}\n尝试路径:\n" + "\n".join(str(x) for x in cands))
-
-
-def _output_path(filename: str) -> Path:
-    """输出统一写到 scripts/ 下（不要求文件已存在）"""
-    script_dir = Path(__file__).resolve().parent
-    return script_dir / filename
-
-
-def _map_to_trade_day(event_dates: pd.Series, trading_dates: np.ndarray, include_same_day: bool) -> pd.Series:
+def _strict_next_trading_day(event_dates: pd.Series, trading_days: np.ndarray) -> pd.Series:
     """
-    将自然日 event_date 映射到交易日：
-      include_same_day=False: 取第一个 trading_date > event_date
-      include_same_day=True : 取第一个 trading_date >= event_date
+    strict next trading day:
+    - 若 event_date 是交易日 -> 映射到下一交易日
+    - 若 event_date 不是交易日 -> 映射到之后第一个交易日
+    - 若超出样本最后交易日 -> NaT
     """
-    trade = []
-    for d in event_dates:
-        if pd.isna(d):
-            trade.append(pd.NaT)
-            continue
+    td = np.asarray(trading_days, dtype="datetime64[ns]")
+    ev = pd.to_datetime(event_dates).values.astype("datetime64[ns]")
 
-        if include_same_day:
-            mask = trading_dates >= np.datetime64(d)
-        else:
-            mask = trading_dates > np.datetime64(d)
+    # searchsorted: insertion index of ev in td (left)
+    idx = np.searchsorted(td, ev, side="left")
 
-        if mask.sum() == 0:
-            trade.append(pd.NaT)
-        else:
-            trade.append(trading_dates[mask.argmax()])
+    # 如果 ev 恰好等于某个交易日，则 strict next -> idx+1
+    in_range = idx < len(td)
+    eq_mask = np.zeros_like(in_range, dtype=bool)
+    eq_mask[in_range] = td[idx[in_range]] == ev[in_range]
+    idx = idx + eq_mask.astype(int)
 
-    return pd.to_datetime(trade)
+    # 安全取值：先 mask 再索引，避免 idx==len(td) 触发越界
+    out = np.full(len(ev), np.datetime64("NaT"), dtype="datetime64[ns]")
+    ok = idx < len(td)
+    out[ok] = td[idx[ok]]
+
+    return pd.to_datetime(out)
+
+
+def _zscore_series(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    mu = x.mean(skipna=True)
+    sd = x.std(skipna=True)
+    if sd is None or not np.isfinite(sd) or sd == 0:
+        return pd.Series(np.zeros(len(x)), index=x.index)
+    return (x - mu) / sd
 
 
 def main():
-    # -----------------------
-    # 1) 读日度收益（交易日序列基准）
-    # -----------------------
-    daily = pd.read_csv(_resolve(DAILY_RETURNS))
-    daily["date"] = pd.to_datetime(daily["date"])
-    daily = daily.sort_values("date").reset_index(drop=True)
+    print("[INFO] Building EGARCH daily dataset (p90 tone + similarity/readability)...")
 
-    trading_dates = daily["date"].values
+    # -------- 1) 日度收益率（交易日基准） --------
+    if not os.path.exists(RET_FILE):
+        raise FileNotFoundError(f"Missing {RET_FILE}")
+    df = pd.read_csv(RET_FILE)
+    if "date" not in df.columns:
+        raise ValueError("daily_returns_4idx.csv must contain 'date'")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
 
-    # -----------------------
-    # 2) 合并日度宏观控制（可选）
-    # -----------------------
-    try:
-        macro = pd.read_csv(_resolve(MACRO_CONTROLS))
-        macro["date"] = pd.to_datetime(macro["date"])
-        daily = daily.merge(macro, on="date", how="left")
-    except FileNotFoundError:
-        pass
+    trading_days = df["date"].values.astype("datetime64[ns]")
 
-    # -----------------------
-    # 3) 读季度 tone + 方差指标（tone_by_quarter_roberta.csv 已被 build_variance_indicators.py 补了 similarity/readability）
-    # -----------------------
-    tone = pd.read_csv(_resolve(TONE_QUARTER))
-    if "Year" in tone.columns:
-        tone = tone.rename(columns={"Year": "year"})
-    if "Quarter" in tone.columns:
-        tone = tone.rename(columns={"Quarter": "quarter"})
+    # 初始化事件列
+    for c in ["S_gdp", "D_gdp", "S_policy", "D_policy"]:
+        if c not in df.columns:
+            df[c] = 0.0
+    df["D_report"] = 0.0
+    df["Similarity"] = 0.0
+    df["Readability"] = 0.0
+    for c in ["tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z"]:
+        df[c] = 0.0
 
-    tone["year"] = pd.to_numeric(tone["year"], errors="coerce").astype("Int64")
-    tone["quarter"] = pd.to_numeric(tone["quarter"], errors="coerce").astype("Int64")
+    # -------- 2) 合并宏观控制（可选） --------
+    if os.path.exists(MACRO_FILE):
+        mc = pd.read_csv(MACRO_FILE)
+        if "date" in mc.columns:
+            mc["date"] = pd.to_datetime(mc["date"])
+            df = df.merge(mc, on="date", how="left")
 
-    if "tone_all" not in tone.columns:
-        raise ValueError("tone_by_quarter_roberta.csv 缺少 tone_all，请先运行 build_roberta_tone.py")
-    if "tone_all_z" not in tone.columns:
-        # 全样本 z-score 兜底（你现在也偏好全样本口径）
-        m = tone["tone_all"].mean()
-        s = tone["tone_all"].std()
-        tone["tone_all_z"] = 0.0 if (pd.isna(s) or s == 0) else (tone["tone_all"] - m) / s
+    # -------- 3) GDP 事件：strict next trading day --------
+    if os.path.exists(GDP_FILE):
+        g = pd.read_csv(GDP_FILE)
+        if "event_date" not in g.columns:
+            raise ValueError("gdp_events.csv must contain 'event_date'")
+        for col in ["S_gdp", "D_gdp"]:
+            if col not in g.columns:
+                raise ValueError(f"gdp_events.csv missing '{col}'")
+        g["event_date"] = pd.to_datetime(g["event_date"])
+        # 只保留样本期内的事件（避免样本外事件被映射到样本首日造成堆叠）
+        g = g[(g["event_date"] >= df["date"].min()) & (g["event_date"] <= df["date"].max())]
+        if len(g) == 0:
+            pass
 
-    # 方差方程用到的列（有就用，没有就置 NA）
-    for c in ["similarity_prev", "surprise_prev", "avg_sent_len"]:
-        if c not in tone.columns:
-            tone[c] = np.nan
+        g["date_mapped"] = _strict_next_trading_day(g["event_date"], trading_days)
+        g = g.dropna(subset=["date_mapped"])
+        g = g.groupby("date_mapped", as_index=False).agg({"S_gdp": "sum", "D_gdp": "max"})
+        df = df.merge(g.rename(columns={"date_mapped": "date"}), on="date", how="left", suffixes=("", "_g"))
+        df["S_gdp"] = df["S_gdp_g"].fillna(df["S_gdp"])
+        df["D_gdp"] = df["D_gdp_g"].fillna(df["D_gdp"])
+        df = df.drop(columns=["S_gdp_g", "D_gdp_g"])
 
-    tone_keep = tone[["year", "quarter", "tone_all", "tone_all_z", "similarity_prev", "surprise_prev", "avg_sent_len"]].copy()
+    # -------- 4) Policy 事件：strict next trading day --------
+    if os.path.exists(POLICY_FILE):
+        p = pd.read_csv(POLICY_FILE)
+        if "event_date" not in p.columns:
+            raise ValueError("policy_events.csv must contain 'event_date'")
+        for col in ["S_policy", "D_policy"]:
+            if col not in p.columns:
+                raise ValueError(f"policy_events.csv missing '{col}'")
+        p["event_date"] = pd.to_datetime(p["event_date"])
+        # 只保留样本期内的事件（避免样本外事件被映射到样本首日造成堆叠）
+        p = p[(p["event_date"] >= df["date"].min()) & (p["event_date"] <= df["date"].max())]
+        if len(p) == 0:
+            pass
 
-    # -----------------------
-    # 4) 读报告发布日期 -> 映射到交易日 -> 生成 ToneAllEvent + D_report + Read/Sim/Surprise
-    # -----------------------
-    report = pd.read_csv(_resolve(REPORT_DATES))
-    report["report_date"] = pd.to_datetime(report["report_date"])
+        p["date_mapped"] = _strict_next_trading_day(p["event_date"], trading_days)
+        p = p.dropna(subset=["date_mapped"])
+        p = p.groupby("date_mapped", as_index=False).agg({"S_policy": "sum", "D_policy": "max"})
+        df = df.merge(p.rename(columns={"date_mapped": "date"}), on="date", how="left", suffixes=("", "_p"))
+        df["S_policy"] = df["S_policy_p"].fillna(df["S_policy"])
+        df["D_policy"] = df["D_policy_p"].fillna(df["D_policy"])
+        df = df.drop(columns=["S_policy_p", "D_policy_p"])
 
-    rep_tone = report.merge(tone_keep, on=["year", "quarter"], how="inner").sort_values("report_date").reset_index(drop=True)
-    rep_tone["trade_date"] = _map_to_trade_day(rep_tone["report_date"], trading_dates, REPORT_INCLUDE_SAME_DAY)
-    rep_tone = rep_tone.dropna(subset=["trade_date"]).copy()
+    # -------- 5) 报告日 + tone（季度 -> 映射到报告反应日，支持窗口） --------
+    if not os.path.exists(REPORT_FILE):
+        raise FileNotFoundError(f"Missing {REPORT_FILE}")
+    rpt = pd.read_csv(REPORT_FILE)
+    if not {"year", "quarter", "report_date"}.issubset(rpt.columns):
+        raise ValueError("report_dates.csv must contain columns: year, quarter, report_date")
+    rpt["report_date"] = pd.to_datetime(rpt["report_date"])
+    # 只保留样本期内的报告（避免样本外报告被映射到样本首日造成堆叠）
+    rpt = rpt[(rpt["report_date"] >= df["date"].min()) & (rpt["report_date"] <= df["date"].max())]
 
-    # 同一天若有多个报告（极少），取均值
-    rep_by_day = (
-        rep_tone.groupby("trade_date")
-        .agg(
-            tone_all=("tone_all", "mean"),
-            tone_all_z=("tone_all_z", "mean"),
-            similarity_prev=("similarity_prev", "mean"),
-            surprise_prev=("surprise_prev", "mean"),
-            avg_sent_len=("avg_sent_len", "mean"),
-        )
-        .reset_index()
-        .rename(columns={"trade_date": "date"})
-    )
+    rpt["date_mapped"] = _strict_next_trading_day(rpt["report_date"], trading_days)
+    rpt = rpt.dropna(subset=["date_mapped"])
 
-    maps = {c: dict(zip(rep_by_day["date"], rep_by_day[c])) for c in rep_by_day.columns if c != "date"}
+    if not os.path.exists(TONEQ_FILE):
+        raise FileNotFoundError(f"Missing {TONEQ_FILE}")
+    tq = pd.read_csv(TONEQ_FILE)
 
-    def map_or_zero(src_col: str, dst_col: str):
-        daily[dst_col] = daily["date"].map(maps.get(src_col, {})).fillna(0.0)
+    required_tone_cols = {"year", "quarter", "tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z"}
+    if not required_tone_cols.issubset(tq.columns):
+        miss = sorted(list(required_tone_cols - set(tq.columns)))
+        raise ValueError(f"tone_by_quarter_roberta.csv missing columns: {miss}")
 
-    map_or_zero("tone_all", "ToneAllEvent_raw")
-    map_or_zero("tone_all_z", "ToneAllEvent_z")
-    map_or_zero("avg_sent_len", "ReadabilityEvent")
-    map_or_zero("similarity_prev", "SimilarityEvent")
-    map_or_zero("surprise_prev", "PolicySurpriseEvent")
+    # 构造季度层 Similarity/Readability（Z-score）
+    # Similarity: similarity_prev（季度之间相似度），Readability: avg_sent_len（句长越长越难读）
+    if "similarity_prev" in tq.columns:
+        tq["Similarity_q"] = _zscore_series(tq["similarity_prev"]).fillna(0.0)
+    else:
+        tq["Similarity_q"] = 0.0
 
-    # ✅ 修正：D_report 用“是否为报告事件日”判定，而不是靠 ToneAllEvent_z 是否为 0
-    report_event_days = set(pd.to_datetime(rep_by_day["date"]))
-    daily["D_report"] = daily["date"].isin(report_event_days).astype(int)
+    if "avg_sent_len" in tq.columns:
+        tq["Readability_q"] = _zscore_series(tq["avg_sent_len"]).fillna(0.0)
+    else:
+        tq["Readability_q"] = 0.0
 
-    # -----------------------
-    # 4b) 分布滞后：构造 tone 的交易日滞后项
-    #   - L0 为原始列（ToneAllEvent_raw / ToneAllEvent_z）
-    #   - L1 表示前一交易日的 tone，依此类推
-    # -----------------------
-    for base in ["ToneAllEvent_raw", "ToneAllEvent_z"]:
-        for k in range(1, TONE_LAGS + 1):
-            daily[f"{base}_L{k}"] = daily[base].shift(k).fillna(0.0)
+    tq_keep = tq[["year", "quarter", "tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z", "Similarity_q", "Readability_q"]].copy()
+    rpt = rpt.merge(tq_keep, on=["year", "quarter"], how="left")
 
+    # 缺失按 0（只影响少数季度）
+    for c in ["tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z", "Similarity_q", "Readability_q"]:
+        rpt[c] = pd.to_numeric(rpt[c], errors="coerce").fillna(0.0)
 
-    # -----------------------
-    # 5) 合并 GDP 事件（S_gdp, D_gdp, forecast availability）
-    # -----------------------
-    gdp = pd.read_csv(_resolve(GDP_EVENTS))
-    if "event_date" not in gdp.columns:
-        raise ValueError("gdp_events.csv 缺少 event_date 列（应为真实公布日）")
-    if "S_gdp" not in gdp.columns or "D_gdp" not in gdp.columns or "forecast_available" not in gdp.columns:
-        raise ValueError("gdp_events.csv 缺少必要列：S_gdp / D_gdp / forecast_available")
+    # 把季度值写入日度（支持窗口）
+    # 为避免窗口扩大导致总冲击放大：WINDOW_SCALE="equal" 时按 (W+1) 等分
+    W = int(REPORT_WINDOW_FORWARD)
+    scale = 1.0
+    if WINDOW_SCALE == "equal":
+        scale = 1.0 / (W + 1.0)
+    elif WINDOW_SCALE == "none":
+        scale = 1.0
+    else:
+        raise ValueError("WINDOW_SCALE must be 'equal' or 'none'")
 
-    gdp["event_date"] = pd.to_datetime(gdp["event_date"])
-    gdp["trade_date"] = _map_to_trade_day(gdp["event_date"], trading_dates, GDP_INCLUDE_SAME_DAY)
-    gdp = gdp.dropna(subset=["trade_date"]).copy()
+    date_to_idx = {pd.Timestamp(d): i for i, d in enumerate(df["date"])}
 
-    gdp_day = (
-        gdp.groupby("trade_date")
-        .agg(
-            S_gdp=("S_gdp", "mean"),
-            D_gdp=("D_gdp", "max"),
-            GDPForecastAvailEvent=("forecast_available", "max"),
-        )
-        .reset_index()
-        .rename(columns={"trade_date": "date"})
-    )
+    for _, row in rpt.iterrows():
+        t0 = pd.Timestamp(row["date_mapped"])
+        if t0 not in date_to_idx:
+            continue
+        i0 = date_to_idx[t0]
+        for k in range(0, W + 1):
+            j = i0 + k
+            if j >= len(df):
+                break
+            # 连续冲击/质量指标按 scale 分摊
+            df.loc[j, "D_report"] += 1.0 * scale
+            df.loc[j, "tone_p90_policy_z"] += float(row["tone_p90_policy_z"]) * scale
+            df.loc[j, "tone_p90_macro_z"]  += float(row["tone_p90_macro_z"]) * scale
+            df.loc[j, "tone_p90_all_z"]    += float(row["tone_p90_all_z"]) * scale
+            df.loc[j, "Similarity"]        += float(row["Similarity_q"]) * scale
+            df.loc[j, "Readability"]       += float(row["Readability_q"]) * scale
 
-    gdp_map = {c: dict(zip(gdp_day["date"], gdp_day[c])) for c in gdp_day.columns if c != "date"}
-    daily["S_gdp"] = daily["date"].map(gdp_map.get("S_gdp", {})).fillna(0.0)
-    daily["D_gdp"] = daily["date"].map(gdp_map.get("D_gdp", {})).fillna(0).astype(int)
-    daily["GDPForecastAvailEvent"] = daily["date"].map(gdp_map.get("GDPForecastAvailEvent", {})).fillna(0).astype(int)
+    # -------- 6) 整理输出 --------
+    # 事件列缺失 -> 0
+    for c in ["S_gdp", "D_gdp", "S_policy", "D_policy", "D_report", "Similarity", "Readability",
+              "tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-    # -----------------------
-    # 6) 合并 Policy 事件（S_policy, D_policy）
-    # -----------------------
-    pol = pd.read_csv(_resolve(POLICY_EVENTS))
-    if "event_date" not in pol.columns or "S_policy" not in pol.columns:
-        raise ValueError("policy_events.csv 缺少必要列：event_date / S_policy")
-    # 兼容：有的版本里可能是 D_policy_any
-    dcol = "D_policy"
-    if dcol not in pol.columns and "D_policy_any" in pol.columns:
-        dcol = "D_policy_any"
-    if dcol not in pol.columns:
-        raise ValueError("policy_events.csv 缺少 D_policy（或 D_policy_any）列")
+    # 输出列：先保证 R 端需要的列都在，再附加其他控制变量
+    core_cols = [
+        "date", "SH", "SZ", "HS300", "CSI500",
+        "S_gdp", "D_gdp", "S_policy", "D_policy",
+        "D_report", "Readability", "Similarity",
+        "tone_p90_policy_z", "tone_p90_macro_z", "tone_p90_all_z"
+    ]
+    missing_core = [c for c in core_cols if c not in df.columns]
+    if missing_core:
+        raise ValueError(f"Output is missing required columns (unexpected): {missing_core}")
 
-    pol["event_date"] = pd.to_datetime(pol["event_date"])
-    pol["trade_date"] = _map_to_trade_day(pol["event_date"], trading_dates, POLICY_INCLUDE_SAME_DAY)
-    pol = pol.dropna(subset=["trade_date"]).copy()
+    other_cols = [c for c in df.columns if c not in core_cols]
+    out = df[core_cols + other_cols].copy()
 
-    pol_day = (
-        pol.groupby("trade_date")
-        .agg(
-            S_policy=("S_policy", "mean"),
-            D_policy=(dcol, "max"),
-        )
-        .reset_index()
-        .rename(columns={"trade_date": "date"})
-    )
-
-    pol_map = {c: dict(zip(pol_day["date"], pol_day[c])) for c in pol_day.columns if c != "date"}
-    daily["S_policy"] = daily["date"].map(pol_map.get("S_policy", {})).fillna(0.0)
-    daily["D_policy"] = daily["date"].map(pol_map.get("D_policy", {})).fillna(0).astype(int)
-
-    # -----------------------
-    # 7) 保存（✅ 修复输出路径）
-    # -----------------------
-    out_path = _output_path(OUT_FILE)
-    daily.to_csv(out_path, index=False, encoding="utf-8-sig")
-
-    print(f"[OK] 输出完成：{out_path}")
-    print("[INFO] D_report=1 个数：", int(daily["D_report"].sum()))
-    print("[INFO] D_gdp=1 个数：", int(daily["D_gdp"].sum()))
-    print("[INFO] D_policy=1 个数：", int(daily["D_policy"].sum()))
-    print(daily.head())
+    out.to_csv(OUT_FILE, index=False)
+    print(f"[OK] Saved: {OUT_FILE}")
+    print("[CHECK] Nonzero counts:",
+          "D_report=", int((out["D_report"] != 0).sum()),
+          "tone_policy=", int((out["tone_p90_policy_z"] != 0).sum()),
+          "tone_macro=", int((out["tone_p90_macro_z"] != 0).sum()),
+          "tone_all=", int((out["tone_p90_all_z"] != 0).sum()),
+          "Similarity=", int((out["Similarity"] != 0).sum()),
+          "Readability=", int((out["Readability"] != 0).sum()),
+          )
+    print("[CHECK] Std:",
+          "Similarity=", float(out["Similarity"].std()),
+          "Readability=", float(out["Readability"].std())
+          )
 
 
 if __name__ == "__main__":

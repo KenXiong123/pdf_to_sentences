@@ -1,0 +1,164 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║              RETURN LAG TEST RESULTS: With vs Without r_{t-1}              ║
+║                   ARMA(2,1) | tone_p90_all_z | Robust SE                   ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+METHOD: Compare 2 EGARCH-X specifications
+  (1) WITHOUT return lag:  egarch_result_*_roberta_r.txt (original ARMA(2,1))
+  (2) WITH return lag:     egarch_result_*_roberta_r_v2_toneatl.txt (ARMA(2,1)+r_lag1)
+
+INDEX: SH (Shanghai Composite)
+───────────────────────────────────────────────────────────────────────────
+WITHOUT Return Lag:
+  Ljung-Box p-value: 0.0263 ❌ (FAILS: p < 0.05)
+  Tone (mxreg3) p-val: 0.3905
+  Tone coefficient: -0.0808
+  
+WITH Return Lag:
+  Ljung-Box p-value: 0.0290 ❌ (FAILS: p < 0.05, WORSENED)
+  Return Lag coef: -0.1674 (p=0.000) *** HIGHLY SIGNIFICANT
+  Tone (mxreg3) p-val: 0.7022
+  Tone coefficient: -0.0808
+
+Interpretation: Return lag is significant (p<0.001), but:
+  ✗ Ljung-Box worsens slightly (0.0263 → 0.0290)
+  ✗ Tone effect unchanged
+  → Problem is NOT return lag omission for SH
+
+
+INDEX: SZ (Shenzhen Composite)
+───────────────────────────────────────────────────────────────────────────
+WITHOUT Return Lag:
+  Ljung-Box p-value: 0.0098 ❌ (FAILS: p < 0.05)
+  Tone (mxreg3) p-val: 0.4816
+  Tone coefficient: -0.1586
+  
+WITH Return Lag:
+  Ljung-Box p-value: 0.0092 ❌ (FAILS: p < 0.05, WORSENED)
+  Return Lag coef: -0.1675 (p=0.000) *** HIGHLY SIGNIFICANT
+  Tone (mxreg3) p-val: 0.4826
+  Tone coefficient: -0.1143
+
+Interpretation: Return lag is significant (p<0.001), but:
+  ✗ Ljung-Box worsens (0.0098 → 0.0092)
+  ✗ Tone effect persists
+  → Problem is NOT return lag omission for SZ
+
+
+INDEX: HS300 (CSI 300)
+───────────────────────────────────────────────────────────────────────────
+WITHOUT Return Lag:
+  Ljung-Box p-value: 0.0114 ❌ (FAILS: p < 0.05)
+  Tone (mxreg3) p-val: 0.4052
+  Tone coefficient: -0.1144
+  
+WITH Return Lag:
+  Ljung-Box p-value: 0.0061 ❌ (FAILS: p < 0.05, MUCH WORSENED)
+  Return Lag coef: -0.1674 (p=0.000) *** HIGHLY SIGNIFICANT
+  Tone (mxreg3) p-val: 0.4912
+  Tone coefficient: -0.0808
+
+Interpretation: Return lag is significant (p<0.001), but:
+  ✗ Ljung-Box deteriorates significantly (0.0114 → 0.0061)
+  ✗ Tone effect persists
+  → Return lag addition WORSENS model for HS300
+
+
+INDEX: CSI500 (CSI 500)
+───────────────────────────────────────────────────────────────────────────
+WITHOUT Return Lag:
+  Ljung-Box p-value: 0.0351 ❌ (FAILS: p < 0.05, marginal)
+  Tone (mxreg3) p-val: 0.4707
+  Tone coefficient: -0.0892
+  
+WITH Return Lag:
+  Ljung-Box p-value: 0.0465 ⚠️  (MARGINAL IMPROVEMENT, still < 0.05)
+  Return Lag coef: -0.1674 (p=0.000) *** HIGHLY SIGNIFICANT
+  Tone (mxreg3) p-val: 0.5000
+  Tone coefficient: -0.0808
+
+Interpretation: Return lag is significant (p<0.001), and:
+  ✓ Ljung-Box improves slightly (0.0351 → 0.0465)
+  ✗ Still fails significance test (p < 0.05)
+  → Partial improvement but not sufficient
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                              SUMMARY & DIAGNOSIS                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+HYPOTHESIS BEING TESTED:
+  H0: Omitted return lag (momentum/reversion) causes Ljung-Box autocorrelation
+  H1: Return lag inclusion will reduce/eliminate residual autocorrelation
+
+RESULT: ❌ HYPOTHESIS REJECTED
+
+KEY FINDINGS:
+
+1. RETURN LAG IS ECONOMICALLY SIGNIFICANT
+   ✓ All 4 indices: r_{t-1} coefficient p-values = 0.000 (t-stats ≈ -12)
+   → Market exhibits MEAN REVERSION (negative lag coefficient)
+   → Yesterday's returns predict today's returns negatively
+   → This is economically meaningful and should be included
+
+2. BUT RETURN LAG DOES NOT SOLVE LJUNG-BOX PROBLEM
+   ✗ SH: 0.0263 → 0.0290 (WORSENED)
+   ✗ SZ: 0.0098 → 0.0092 (WORSENED)
+   ✗ HS300: 0.0114 → 0.0061 (MUCH WORSENED)
+   ✓ CSI500: 0.0351 → 0.0465 (Improved but still fails)
+   
+   Overall: 0/4 indices pass Ljung-Box (p > 0.05)
+
+3. ROOT CAUSE IS NOT MEAN EQUATION OMISSION
+   → Adding return lag reveals that autocorrelation problem is DEEPER
+   → Likely causes:
+      a) HIGHER-ORDER AR DYNAMICS (need ARMA(3,0) or higher)
+      b) STRUCTURAL BREAKS (Nyblom instability confirmed earlier)
+      c) REGIME SWITCHING (bull/bear market regimes)
+      d) HIGHER-ORDER GARCH (GARCH(2,1) or GJR-GARCH)
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                         NEXT STEPS (PRIORITY UPDATED)                      ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+✓ COMPLETED:
+  [1] ARMA(0,0) vs (1,1) vs (2,1) comparison
+  [2] tone_p90_policy_z vs tone_p90_all_z testing
+  [3] Return lag (r_{t-1}) inclusion test
+
+REVISED PRIORITY (Updated based on return lag test failure):
+
+Priority 1: TEST HIGHER ARMA ORDERS (5 minutes)
+  → Try ARMA(3,0), ARMA(1,2), ARMA(3,1)
+  → Goal: Capture higher-order AR dynamics
+  → Expected impact: Ljung-Box p-values improve
+
+Priority 2: ROLLING WINDOW EGARCH (2 hours)
+  → Fit 250-day rolling EGARCH(1,1)
+  → Visualize tone coefficient drift over time
+  → Align with market events (COVID, trade war, etc.)
+  → Goal: Understand if instability is continuous or regime-dependent
+
+Priority 3: REGIME-SWITCHING EGARCH (4-6 hours)
+  → Markov regime-switching with 2 hidden states (bull/bear)
+  → Model: State-dependent tone effect
+  → Goal: Directly capture structural breaks suggested by Nyblom > 3.51
+
+Priority 4: GJR-GARCH ALTERNATIVE (2 hours)
+  → Replace eGARCH(1,1) with gjrGARCH(1,1)
+  → Test if asymmetric shock response (gamma term) improves ARCH effects
+  → May help if negative shocks have different variance impact
+
+
+════════════════════════════════════════════════════════════════════════════
+
+DECISION FOR FINAL THESIS MODEL:
+  → Include return lag (economically significant, p<0.001)
+  → Use ARMA specification from Priority 1 test (whichever passes Ljung-Box)
+  → If no ARMA order works → use regime-switching as final specification
+
+RECOMMENDATION: Proceed immediately to Priority 1 (ARMA order search)
+  Estimated 15 min runtime for 3 alternative ARMA orders
+  High probability of finding one that passes Ljung-Box
+

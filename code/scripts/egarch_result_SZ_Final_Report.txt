@@ -1,0 +1,155 @@
+****************************************************************
+* EGARCH MODEL ESTIMATION REPORT                  *
+****************************************************************
+Target Index   :  SZ 
+Model Spec     : eGARCH(1,1)-X with Student-t Distribution
+Date Range     :  2005-09-27  to  2024-12-31 
+Observations   :  4680 
+
+----------------------------------------------------------------
+>> VARIABLE DEFINITIONS (VARIABLES USED):
+----------------------------------------------------------------
+[Mean Equation - Determinants of Returns]
+  mu          : Constant
+  ar1         : AR(1) Term
+  mxreg1      : S_gdp        (GDP Surprise)
+  mxreg2      : S_policy     (Interest Rate Shock)
+  mxreg3      : TonePolicy   (Central Bank Policy Tone, P90, T+1)
+  mxreg4      : ToneMacro    (Central Bank Macro Tone, P90, T+1)
+
+[Variance Equation - Determinants of Volatility]
+  omega       : Constant
+  alpha1/beta : GARCH terms
+  vxreg1      : D_report     (Report Release Dummy)
+  vxreg2      : Similarity   (Text Similarity vs Previous)
+  vxreg3      : Readability  (Avg Sentence Length, avg_len)
+  vxreg4      : ToneRisk     (Central Bank Risk Tone, P90, T+1)
+----------------------------------------------------------------
+
+>> ESTIMATION OUTPUT:
+
+*---------------------------------*
+*          GARCH Model Fit        *
+*---------------------------------*
+
+Conditional Variance Dynamics 	
+-----------------------------------
+GARCH Model	: eGARCH(1,1)
+Mean Model	: ARFIMA(1,0,0)
+Distribution	: std 
+
+Optimal Parameters
+------------------------------------
+         Estimate  Std. Error     t value Pr(>|t|)
+mu       2.973002    1.951603  1.5234e+00 0.127668
+ar1      0.007828    0.014318  5.4674e-01 0.584558
+mxreg1  41.443958   39.936670  1.0377e+00 0.299390
+mxreg2 -57.938919   20.488789 -2.8278e+00 0.004686
+mxreg3  64.680498   23.426489  2.7610e+00 0.005762
+mxreg4 -23.466504   17.914369 -1.3099e+00 0.190221
+omega    0.113355    0.002330  4.8649e+01 0.000000
+alpha1  -0.014999    0.007626 -1.9668e+00 0.049201
+beta1    0.989066    0.000007  1.3406e+05 0.000000
+gamma1   0.148229    0.002839  5.2203e+01 0.000000
+vxreg1   1.221928    1.434653  8.5172e-01 0.394368
+vxreg2  -0.826994    0.737279 -1.1217e+00 0.261997
+vxreg3  -0.062752    0.077081 -8.1410e-01 0.415585
+vxreg4   0.141621    0.165990  8.5319e-01 0.393554
+shape    5.920278    0.514695  1.1502e+01 0.000000
+
+Robust Standard Errors:
+         Estimate  Std. Error     t value Pr(>|t|)
+mu       2.973002    2.162846  1.3746e+00 0.169262
+ar1      0.007828    0.011044  7.0878e-01 0.478460
+mxreg1  41.443958   43.945452  9.4308e-01 0.345641
+mxreg2 -57.938919   25.274695 -2.2924e+00 0.021884
+mxreg3  64.680498   27.044923  2.3916e+00 0.016775
+mxreg4 -23.466504   21.477075 -1.0926e+00 0.274556
+omega    0.113355    0.002407  4.7093e+01 0.000000
+alpha1  -0.014999    0.009579 -1.5657e+00 0.117413
+beta1    0.989066    0.000008  1.2438e+05 0.000000
+gamma1   0.148229    0.003279  4.5209e+01 0.000000
+vxreg1   1.221928    1.239627  9.8572e-01 0.324269
+vxreg2  -0.826994    0.652357 -1.2677e+00 0.204904
+vxreg3  -0.062752    0.066258 -9.4708e-01 0.343596
+vxreg4   0.141621    0.161056  8.7933e-01 0.379224
+shape    5.920278    0.551174  1.0741e+01 0.000000
+
+LogLikelihood : -30168.09 
+
+Information Criteria
+------------------------------------
+                   
+Akaike       12.899
+Bayes        12.919
+Shibata      12.899
+Hannan-Quinn 12.906
+
+Weighted Ljung-Box Test on Standardized Residuals
+------------------------------------
+                        statistic   p-value
+Lag[1]                      6.696 9.665e-03
+Lag[2*(p+q)+(p+q)-1][2]     6.709 6.834e-06
+Lag[4*(p+q)+(p+q)-1][5]    10.985 4.060e-04
+d.o.f=1
+H0 : No serial correlation
+
+Weighted Ljung-Box Test on Standardized Squared Residuals
+------------------------------------
+                        statistic   p-value
+Lag[1]                      10.14 1.452e-03
+Lag[2*(p+q)+(p+q)-1][5]     22.37 4.309e-06
+Lag[4*(p+q)+(p+q)-1][9]     24.70 1.179e-05
+d.o.f=2
+
+Weighted ARCH LM Tests
+------------------------------------
+            Statistic Shape Scale P-Value
+ARCH Lag[3]     6.143 0.500 2.000 0.01319
+ARCH Lag[5]     6.536 1.440 1.667 0.04490
+ARCH Lag[7]     6.571 2.315 1.543 0.10727
+
+Nyblom stability test
+------------------------------------
+Joint Statistic:  5.6883
+Individual Statistics:             
+mu     1.3309
+ar1    0.2582
+mxreg1 0.2023
+mxreg2 0.5158
+mxreg3 0.0804
+mxreg4 0.5143
+omega  0.6369
+alpha1 0.2098
+beta1  0.6847
+gamma1 0.2279
+vxreg1 0.6800
+vxreg2 0.7020
+vxreg3 0.6597
+vxreg4 0.6248
+shape  0.2494
+
+Asymptotic Critical Values (10% 5% 1%)
+Joint Statistic:     	 3.26 3.54 4.07
+Individual Statistic:	 0.35 0.47 0.75
+
+Sign Bias Test
+------------------------------------
+                   t-value    prob sig
+Sign Bias           1.9908 0.04656  **
+Negative Sign Bias  0.2136 0.83086    
+Positive Sign Bias  1.1989 0.23063    
+Joint Effect        5.7170 0.12622    
+
+
+Adjusted Pearson Goodness-of-Fit Test:
+------------------------------------
+  group statistic p-value(g-1)
+1    20     30.43      0.04661
+2    30     40.87      0.07066
+3    40     55.86      0.03912
+4    50     67.78      0.03895
+
+
+Elapsed time : 3.484475 
+
