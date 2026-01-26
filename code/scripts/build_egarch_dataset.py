@@ -38,7 +38,7 @@ OUT_FILE    = "egarch_daily_data_roberta.csv"
 
 # ===== 可调参数 =====
 # 报告窗口向后扩展天数：0=只在反应日（t）有冲击；1= t 与 t+1；2= t..t+2
-REPORT_WINDOW_FORWARD = 0
+REPORT_WINDOW_FORWARD = 5
 # 连续变量（tone/Similarity/Readability/D_report）在窗口内的分配方式：
 # - "equal": 等分到窗口每一天（总冲击守恒，推荐）
 # - "none" : 每一天都赋同一个值（会放大总冲击，不推荐）

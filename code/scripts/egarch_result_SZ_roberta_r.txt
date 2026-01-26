@@ -1,11 +1,21 @@
 ============================================================
-EGARCH-X results (aligned with Jiang Fuwei's framework)
+EGARCH-X results
 Index: SZ 
-ARMA_MODE: fixed 
-ARMA used: 2 , 1 
-Mean regressors used: S_gdp, S_policy, tone_p90_policy_z 
-Variance regressors used: D_report, Readability, Similarity 
+TEXT_MODE: split 
+ARMA_MODE: auto 
+ARMA used: 0 , 1 
+Mean regressors used: S_gdp, S_policy, tone_p90_policy_z, tone_p90_macro_z 
+Variance regressors used: D_gdp, D_policy, D_report, Readability, Similarity 
 ============================================================
+
+[ARMA candidate table] (BIC lower is better; selected based on ARMA+X regression)
+  p q      bic      aic   ok
+1 0 0 18671.31 18639.05 TRUE
+2 1 0 18668.94 18630.23 TRUE
+3 1 1 18675.09 18629.93 TRUE
+4 2 0 18675.43 18630.27 TRUE
+5 2 1 18683.38 18631.77 TRUE
+6 0 1 18668.48 18629.77 TRUE
 
 
 *---------------------------------*
@@ -15,121 +25,124 @@ Variance regressors used: D_report, Readability, Similarity
 Conditional Variance Dynamics 	
 -----------------------------------
 GARCH Model	: eGARCH(1,1)
-Mean Model	: ARFIMA(2,0,1)
+Mean Model	: ARFIMA(0,0,1)
 Distribution	: std 
 
 Optimal Parameters
 ------------------------------------
-        Estimate  Std. Error   t value Pr(>|t|)
-mu      0.034015    0.019426   1.75102 0.079943
-ar1    -0.822863    0.128684  -6.39446 0.000000
-ar2    -0.007200    0.018844  -0.38207 0.702409
-ma1     0.833645    0.131155   6.35619 0.000000
-mxreg1  0.205904    0.376538   0.54683 0.584492
-mxreg2 -0.160317    0.202546  -0.79151 0.428649
-mxreg3  0.165602    0.241005   0.68713 0.492002
-omega   0.012287    0.002287   5.37234 0.000000
-alpha1 -0.015130    0.006848  -2.20926 0.027156
-beta1   0.988980    0.001461 676.76046 0.000000
-gamma1  0.150205    0.023379   6.42474 0.000000
-vxreg1 -0.138150    0.095961  -1.43965 0.149966
-vxreg2 -0.093792    0.086014  -1.09042 0.275526
-vxreg3 -0.074135    0.068548  -1.08151 0.279471
-shape   5.937032    0.499040  11.89691 0.000000
+         Estimate  Std. Error   t value Pr(>|t|)
+mu      -0.008187    0.000010   -859.57        0
+ma1      0.034099    0.000011   3070.31        0
+mxreg1 -24.434663    0.028101   -869.54        0
+mxreg2 -33.569212    0.013153  -2552.20        0
+mxreg3  -3.151063    0.000734  -4291.83        0
+mxreg4   2.486137    0.004843    513.33        0
+omega   -1.268790    0.001240  -1022.81        0
+alpha1   0.141476    0.000528    268.17        0
+beta1    0.873266    0.000696   1255.04        0
+gamma1   3.912639    0.004258    918.87        0
+vxreg1  14.822388    0.011168   1327.21        0
+vxreg2   1.012775    0.000602   1681.73        0
+vxreg3  -7.275614    0.000684 -10630.65        0
+vxreg4   4.277124    0.005041    848.44        0
+vxreg5   6.562001    0.008240    796.31        0
+shape    3.956014    0.000770   5138.23        0
 
 Robust Standard Errors:
-        Estimate  Std. Error   t value Pr(>|t|)
-mu      0.034015    0.021362   1.59226 0.111326
-ar1    -0.822863    0.109462  -7.51733 0.000000
-ar2    -0.007200    0.017127  -0.42038 0.674210
-ma1     0.833645    0.112832   7.38840 0.000000
-mxreg1  0.205904    0.314435   0.65484 0.512572
-mxreg2 -0.160317    0.231340  -0.69299 0.488315
-mxreg3  0.165602    0.343865   0.48159 0.630098
-omega   0.012287    0.002431   5.05414 0.000000
-alpha1 -0.015130    0.011590  -1.30542 0.191750
-beta1   0.988980    0.002900 341.01959 0.000000
-gamma1  0.150205    0.040338   3.72369 0.000196
-vxreg1 -0.138150    0.088444  -1.56201 0.118287
-vxreg2 -0.093792    0.081098  -1.15653 0.247466
-vxreg3 -0.074135    0.062470  -1.18672 0.235337
-shape   5.937032    0.607599   9.77131 0.000000
+         Estimate  Std. Error   t value Pr(>|t|)
+mu      -0.008187     0.16540 -0.049498  0.96052
+ma1      0.034099     0.44245  0.077069  0.93857
+mxreg1 -24.434663   461.89032 -0.052901  0.95781
+mxreg2 -33.569212   155.63973 -0.215685  0.82923
+mxreg3  -3.151063    12.86808 -0.244874  0.80655
+mxreg4   2.486137    80.65225  0.030825  0.97541
+omega   -1.268790    19.40432 -0.065387  0.94787
+alpha1   0.141476     8.97899  0.015756  0.98743
+beta1    0.873266    12.68177  0.068860  0.94510
+gamma1   3.912639    80.93508  0.048343  0.96144
+vxreg1  14.822388   117.99005  0.125624  0.90003
+vxreg2   1.012775    11.87916  0.085256  0.93206
+vxreg3  -7.275614    20.76528 -0.350374  0.72606
+vxreg4   4.277124    95.12012  0.044966  0.96413
+vxreg5   6.562001   138.94128  0.047229  0.96233
+shape    3.956014    38.99357  0.101453  0.91919
 
-LogLikelihood : -8621.621 
+LogLikelihood : -26733.07 
 
 Information Criteria
 ------------------------------------
                    
-Akaike       3.6909
-Bayes        3.7115
-Shibata      3.6908
-Hannan-Quinn 3.6981
+Akaike       11.431
+Bayes        11.453
+Shibata      11.431
+Hannan-Quinn 11.439
 
 Weighted Ljung-Box Test on Standardized Residuals
 ------------------------------------
-                         statistic   p-value
-Lag[1]                       6.669 9.812e-03
-Lag[2*(p+q)+(p+q)-1][8]     13.376 0.000e+00
-Lag[4*(p+q)+(p+q)-1][14]    18.137 7.162e-05
-d.o.f=3
+                        statistic p-value
+Lag[1]                  7.868e-05  0.9929
+Lag[2*(p+q)+(p+q)-1][2] 4.218e-03  1.0000
+Lag[4*(p+q)+(p+q)-1][5] 5.937e-02  1.0000
+d.o.f=1
 H0 : No serial correlation
 
 Weighted Ljung-Box Test on Standardized Squared Residuals
 ------------------------------------
-                        statistic   p-value
-Lag[1]                       9.41 2.158e-03
-Lag[2*(p+q)+(p+q)-1][5]     20.01 1.930e-05
-Lag[4*(p+q)+(p+q)-1][9]     22.02 5.998e-05
+                        statistic p-value
+Lag[1]                  0.0009047   0.976
+Lag[2*(p+q)+(p+q)-1][5] 0.0026444   1.000
+Lag[4*(p+q)+(p+q)-1][9] 0.0778101   1.000
 d.o.f=2
 
 Weighted ARCH LM Tests
 ------------------------------------
             Statistic Shape Scale P-Value
-ARCH Lag[3]     5.145 0.500 2.000 0.02331
-ARCH Lag[5]     5.380 1.440 1.667 0.08387
-ARCH Lag[7]     5.430 2.315 1.543 0.18450
+ARCH Lag[3] 0.0008972 0.500 2.000  0.9761
+ARCH Lag[5] 0.0019859 1.440 1.667  1.0000
+ARCH Lag[7] 0.0029652 2.315 1.543  1.0000
 
 Nyblom stability test
 ------------------------------------
-Joint Statistic:  4.7271
+Joint Statistic:  14.8926
 Individual Statistics:              
-mu     1.20439
-ar1    0.76892
-ar2    0.59150
-ma1    0.80417
-mxreg1 0.04693
-mxreg2 0.12379
-mxreg3 0.20178
-omega  0.62774
-alpha1 0.22497
-beta1  0.86443
-gamma1 0.18955
-vxreg1 0.67841
-vxreg2 0.23859
-vxreg3 0.07921
-shape  0.24222
+mu     0.47891
+ma1    1.05512
+mxreg1 0.07219
+mxreg2 0.33428
+mxreg3 0.37535
+mxreg4 2.35745
+omega  0.03333
+alpha1 4.29916
+beta1  0.22218
+gamma1 0.56789
+vxreg1 0.38544
+vxreg2 0.36652
+vxreg3 0.29598
+vxreg4 0.34050
+vxreg5 0.11572
+shape  0.07671
 
 Asymptotic Critical Values (10% 5% 1%)
-Joint Statistic:     	 3.26 3.54 4.07
+Joint Statistic:     	 3.46 3.75 4.3
 Individual Statistic:	 0.35 0.47 0.75
 
 Sign Bias Test
 ------------------------------------
-                   t-value    prob sig
-Sign Bias           2.0466 0.04075  **
-Negative Sign Bias  0.1921 0.84763    
-Positive Sign Bias  1.1222 0.26183    
-Joint Effect        6.0520 0.10911    
+                   t-value   prob sig
+Sign Bias           0.9744 0.3299    
+Negative Sign Bias  0.1492 0.8814    
+Positive Sign Bias  0.7357 0.4620    
+Joint Effect        1.3740 0.7116    
 
 
 Adjusted Pearson Goodness-of-Fit Test:
 ------------------------------------
   group statistic p-value(g-1)
-1    20     27.89     0.085590
-2    30     44.72     0.031334
-3    40     54.77     0.048187
-4    50     75.15     0.009541
+1    20      7927            0
+2    30     11433            0
+3    40     14823            0
+4    50     17643            0
 
 
-Elapsed time : 1.522181 
+Elapsed time : 0.7765627 
 
